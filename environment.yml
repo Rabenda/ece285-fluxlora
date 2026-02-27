@@ -1,0 +1,38 @@
+name: flux_vlm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  # --- 基础 ---
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - tqdm
+  - pillow
+  - pyyaml
+
+  # --- PyTorch (CUDA 12.x, 适配 50 系显卡) ---
+  - pytorch=2.1.*
+  - torchvision
+  - pytorch-cuda=12.1
+
+  # --- pip 安装的包 ---
+  - pip:
+      # diffusion / transformers
+      - diffusers>=0.24
+      - transformers>=4.36
+      - accelerate
+      - safetensors
+
+      # VLM / CLIP
+      - open_clip_torch>=2.24
+
+      # evaluation / visualization
+      - lpips
+      - matplotlib
+      - opencv-python
+
+      # logging (可选)
+      - tensorboard

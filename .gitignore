@@ -1,0 +1,43 @@
+# Environment
+.conda/
+venv/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+.Python
+
+# Data & outputs (do not commit; others use their own)
+data/real/
+data/cartoon/
+data/inference/
+checkpoints/
+checkpoints_stage*/
+samples/
+samples_*/
+
+# Model weights & large binaries
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Sensitive
+hf_token.txt
+*.key
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Optional: uncomment to ignore all images in repo root (keep samples out)
+# *.png
+# *.jpg
+# *.jpeg
