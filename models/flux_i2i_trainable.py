@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 from diffusers import FluxTransformer2DModel, FluxPipeline
 from transformers import BitsAndBytesConfig, CLIPVisionModel
@@ -273,7 +274,10 @@ class FluxI2ITrainable(nn.Module):
             return None, None
 
         # --------- 4) Preview ----------
-        with torch.no_grad():
+        # Stage3 需要 preview 带梯度，使 L_ID 能回传到 LoRA；其余情况用 no_grad 省显存
+        need_preview_grad = self.training and return_aux
+        preview_ctx = nullcontext() if need_preview_grad else torch.no_grad()
+        with preview_ctx:
             t_p = torch.full((bsz,), float(preview_t), device=device, dtype=dtype)
             noise_p = torch.randn_like(packed_latents)
             x_tp = (1.0 - t_p.view(-1, 1, 1)) * packed_latents + t_p.view(-1, 1, 1) * noise_p

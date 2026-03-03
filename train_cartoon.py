@@ -1,3 +1,21 @@
+"""
+Stage2 / Stage3 训练脚本。Stage1 为仅推理基线，见 inference.py（不传 --checkpoint）。
+
+数据：--train_dir 下需有 real/ 与 cartoon/ 两个子目录（可用 scripts/download_stable_faces.py 准备）。
+训练完成后用 inference.py 加载 checkpoint 做推理；其他同学只需跑本脚本 + inference.py 即可复现。
+
+# Stage2：仅 LoRA（流损失）
+python train_cartoon.py --stage stage2 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
+
+# Stage3：LoRA + 身份损失（推荐）
+python train_cartoon.py --stage stage3 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
+
+# 从已有 checkpoint 续训
+python train_cartoon.py --stage stage3 --train_dir ./data --resume
+
+# 训练前做环境自检（可选）
+python train_cartoon.py --stage stage3 --train_dir ./data --sanity_check
+"""
 import argparse
 import glob
 import os
@@ -58,10 +76,11 @@ def parse_args():
     parser.add_argument("--gamma_start", type=float, default=2.0)
     parser.add_argument("--gamma_end", type=float, default=2.0)
     parser.add_argument("--gamma_warmup_steps", type=int, default=0)
-    parser.add_argument("--stage", type=str, default="stage3", choices=["stage1", "stage2", "stage3"])
+    parser.add_argument("--stage", type=str, default="stage3", choices=["stage2", "stage3"], help="stage2: LoRA only; stage3: LoRA + identity loss.")
     parser.add_argument("--lambda0", type=float, default=0.6, help="Identity loss base weight in stage3.")
     parser.add_argument("--lambda_p", type=float, default=2.0, help="Time-dependent exponent in stage3.")
     parser.add_argument("--use_autocast", action="store_true")
+    parser.add_argument("--sanity_check", action="store_true", help="训练前跑一次环境/模型自检；未通过则退出。默认关闭。")
     return parser.parse_args()
 
 
@@ -78,6 +97,14 @@ def main():
     print(f"Loading model for {args.stage} ...")
     model = FluxI2ITrainable().to(device)
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
+
+    # 可选：环境自检，未通过则直接退出
+    if args.sanity_check:
+        from sanity_check import run_sanity_check
+        if not run_sanity_check(device, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, verbose=True):
+            print("Training aborted: sanity check failed. Please fix environment (e.g. CUDA, VRAM, dependencies).")
+            return
+        print()
 
     id_criterion = None
     if args.stage == "stage3":
@@ -121,12 +148,9 @@ def main():
             cartoon_imgs = batch["cartoon"].to(device, non_blocking=True)
             gamma = gamma_schedule(global_step, args.gamma_start, args.gamma_end, args.gamma_warmup_steps)
 
-            if args.stage == "stage1":
-                cond_image = real_imgs
-                target_image = real_imgs
-            else:
-                cond_image = real_imgs
-                target_image = cartoon_imgs
+            # Stage2/3: condition on real, target latent toward cartoon
+            cond_image = real_imgs
+            target_image = cartoon_imgs
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
                 rf_loss, preview, aux = model(

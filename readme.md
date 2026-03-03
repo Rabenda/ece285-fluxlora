@@ -1,63 +1,82 @@
-1. 风格化的评判维度，可以很「工程化」
-你可以把风格化拆成三块：风格强度、身份保持、视觉质量，这三块本身就构成了一个「评估框架」，哪怕数值不完美，也显得很专业。
-(1) Identity Preservation（身份保持）
-指标：你报告里的 Face-Sim / SID。
-实现：用 CLIP / face 模型算 cos(phi(real), phi(gen)) 平均值。
-预期趋势：
-Stage I：Face-Sim 高（接近 0.8+），风格弱。
-Stage II：Face-Sim 明显下降，风格增强。
-Stage III：Face-Sim 相比 Stage II 有回升（哪怕只回升一点点），这就足以支撑你方法的价值。
-(2) Stylization Degree（风格强度）
-你可以用两类东西来衡量：
-定量（自动）：
-CLIP Score：
-Text："a high-quality Japanese anime portrait illustration"
-Image：生成图
-算 cos(clip(text), clip(image))，平均一下。
-趋势预期：Stage I < Stage II ≈ Stage III。
-定性（人类主观）：
-让几个人（同学、自己多次随机打分）对三种输出（I/II/III）各打 1–5 分：
-1 = 几乎是照片，滤镜感
-3 = 有明显动漫风，但还偏写实
-5 = 非常动漫化，线条 / 色块明显
-你可以只做一个 very small 的问卷（例如 10 张图 × 3 个设置 × 3–5 个评价者），画一个平均柱状图即可。
-(3) Visual Quality（伪影 / 崩坏程度）
-主观评价：
-是否有大面积噪点、裂脸、变形、不自然线条。
-可以写成文字 + 对比图：
-Stage II 可能更容易产生 over-stylization 造成的五官偏移 / 不自然区域；
-Stage III 虽然不一定更「好看」，但在面部结构上更接近输入。
+# ECE 285 卡通风格化项目
 
-2. 对于课程报告，「效果不好怎么办」？
-只要你做到下面三点，即使图不惊艳，也是好的研究报告：
-（1）把「为什么效果不完美」说清楚
-例如：
-cartoon 域数据较小 / 风格不统一；
-训练步数有限（几千步而不是几十万步）；
-FLUX.1-schnell 本身有 photorealistic bias，需要更强的 LoRA 容量；
-identity backbone 用的是 CLIP 而不是专门的人脸网络，在强风格时打分可能不稳定。
-（2）展示「趋势」而不是追求绝对效果
-只要你能展示：
-Stage II 的 CLIP 风格分数高于 Stage I；
-Stage III 的 Face-Sim 分数高于 Stage II；
-即使实际图看起来只是「稍微卡通一点」，从实验设计和结果分析角度，已经证明你的方法在「朝正确方向」工作。
-（3）诚实地展示失败/不足
-比如：在某些样本上，Stage III 的 identity 并没有变好，甚至变差；
-你可以在 Discussion 里专门列一个小 subsection：
-哪些场景下 identity loss 帮助明显；
-哪些场景下因为 CLIP 域偏差、极端风格、头发遮挡等原因，效果不好。
-老师非常喜欢看到「方法局限性 + 未来改进方向」，这比硬吹效果强太多。
+复现流程：准备数据（`data/real`、`data/cartoon`）后，依次运行 **train_cartoon.py**（训练）和 **inference.py**（推理）即可。
 
-3. 给你一个「最低完成标准」的心里锚点
-你可以把「合格 / 能交差」的标准定得相对现实一些：
-视觉上：
-部分样本中，Stage II / III 相比 Stage I，肉眼能看到明显的卡通风格增强（线条更硬、颜色更块状）。
-即便 identity 不是百分百相似，但观感上还能认出是同一个人。
-定量上（哪怕非常粗糙）：
-Stage II 的「风格分」（CLIP text-image 相似度）高于 Stage I；
-Stage III 的平均身份相似度（Face-Sim）高于 Stage II 至少一点点（比如 +0.02 / +0.05）。
-分析上：
-你有 ablation 表（I / II / III 三行，几列指标），有可视化对比图，有对「好与不好」的解释。
-做到这些，即使图像还达不到你理想中的“动漫头像生成器”级别，对课程来说也已经是一个完整、严谨的 midterm project。
+## 项目结构
 
+```
+project/
+├── train_cartoon.py      # 训练入口
+├── inference.py          # 推理入口
+├── evaluate.py           # 评估入口（也可单独跑）
+├── sanity_check.py       # 训练前自检（被 train 调用）
+├── dataset.py            # 数据集定义
+├── identity_loss.py      # Stage3 身份损失
+├── readme.md
+├── environment.yml
+├── .gitignore
+├── models/
+│   └── flux_i2i_trainable.py
+└── scripts/
+    └── download_stable_faces.py
+```
 
+---
+
+## 1. 核心目标：Image-only 风格化
+
+- **目标**：实现**仅凭图像驱动**的真人→卡通转换，无需文本 prompt。
+- **与论文一致**：论文中的「Unpaired Data Strategy（非配对数据策略）」正是为了摆脱对文本提示词或成对数据的依赖。
+- **技术逻辑**：在训练中将 LoRA 注入 FLUX.1 的注意力层，把「动漫风格」这一高维先验固化到模型参数里；推理阶段不输入任何文本，LoRA 也会引导潜变量向动漫流形偏移。
+
+**一句话**：我们通过损失函数训练 LoRA，使模型在**没有提示词**的情况下自发偏卡通化。
+
+---
+
+## 2. 损失函数在 LoRA 中的作用（对应论文 2.3 节）
+
+- **$\mathcal{L}_{RF}$（流损失）**：让 LoRA 学习动漫的纹理、线条和赛璐璐上色风格。
+- **$\mathcal{L}_{ID}$（身份损失）**：作为「锚点」，保证风格转换时不把人脸改得面目全非。实现上使用**人脸识别网络 FaceNet（InceptionResnetV1，VGGFace2）**作为 backbone，与评估指标 Face-Sim 一致，符合身份感知风格化常用做法（如 VToonify、DualStyleGAN）。
+
+**结果**：训好的 LoRA 既知道如何变动漫（来自 $\mathcal{L}_{RF}$），又知道哪里不能乱动（来自 $\mathcal{L}_{ID}$），相当于一个带身份约束的智能滤镜。
+
+---
+
+## 3. Image-only 推理在做什么？
+
+### 3.1 Stage 1 时模型在做什么？
+
+- **输入**：仅一张真人图。
+- **前向**：真人图 → CLIP 编码 → 经（未训练的）vlm_proj / pooled_proj 得到 condition → 与 Stage 2/3 相同的 UNet 前向（从 noised latent 一步步 denoise）。
+- **没有任何东西在“告诉”模型“画成动漫”**：没有 text prompt，也没有学过 real→cartoon 的 LoRA。
+
+因此模型只做一件事：在「这张真人图的 CLIP 条件」下，用预训练 FLUX 的 prior 做一次 denoise；它没学过在这种 condition 下往卡通 latent 走，所以**不会主动往动漫风格走**。
+
+### 3.2 生成图会是什么？——确实不是动漫
+
+- **偏重建**：condition 强烈指向输入，预训练 FLUX 倾向于还原 → 输出很像输入，身份保持好，几乎无风格化。
+- **或偏乱/不稳定**：image embedding + 随机投影对 FLUX 是 out-of-distribution，输出可能怪，但依然不是「有意识的」卡通。
+
+**结论**：Stage 1 的输出 = 不是动漫，多半是「像原图」或「怪但也不是卡通」，正好作为 baseline。
+
+### 3.3 推理逻辑（报告里可这样写）
+
+- **Stage 1 在做什么**：使用与 Stage 2/3 **完全相同的** image-only 推理流程；只输入真人图，不提供任何文本 prompt，不加载任何训练的 LoRA。模型没有任何「画成动漫」的指令或训练，只是在相同架构下用原版 FLUX 做一次以该图为条件的生成。
+- **预期结果**：Stage 1 的输出**不会**呈现卡通风格（如 CLIP 风格分数低），可能接近输入（Face-Sim 高）或 otherwise 非卡通，作为对照组。
+- **证明了什么**：在我们这套**不加 prompt、只靠图像条件**的 pipeline 里，原版 FLUX 做不出卡通风格；只有经过 Stage 2/3 训练后，同一套 image-only 推理才会产生卡通风格。
+
+**一句话**：同样的 image-only 流程，零 shot = 不卡通（且常偏像原图）；训完 LoRA 后 = 卡通。Stage 1 的逻辑就是：不训就不出卡通。
+
+---
+
+## 4. 三阶段指标趋势（消融）
+
+| 阶段 | CLIP Score（风格） | Face-Sim（身份） | FID（分布质量） |
+|------|--------------------|------------------|------------------|
+| **Stage 1 (Baseline)** | 极低 | 极高 | 极高 |
+| **Stage 2 (LoRA-only)** | 飙升 | 骤降 | 下降 |
+| **Stage 3 (Ours)** | 保持高位 | 显著回升 | 最低 |
+
+- Stage 1：原版 FLUX 零 shot，风格弱、身份保持最好。
+- Stage 2：LoRA 注入风格，CLIP 升、Face-Sim 降（身份漂移）。
+- Stage 3：加身份损失，在保持高风格的同时把 Face-Sim 拉回，FID 达到最低。
