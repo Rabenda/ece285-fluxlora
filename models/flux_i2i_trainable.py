@@ -2,10 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import nullcontext
+import inspect
 
 from diffusers import FluxTransformer2DModel, FluxPipeline
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 from peft import LoraConfig, get_peft_model
+
+
+def _flux_unet_accepts_guidance(unet: FluxTransformer2DModel) -> bool:
+    """
+    檢查給定的 FluxTransformer2DModel 是否在 forward 簽名中接受 guidance 參數。
+    這比依賴 diffusers 版本號更可靠，可同時相容舊版與 0.30+/0.36+。
+    """
+    try:
+        sig = inspect.signature(unet.forward)
+        return "guidance" in sig.parameters
+    except Exception:
+        # 若無法檢查簽名，保守地視為接受 guidance，以相容舊版行為。
+        return True
 
 
 class FluxI2ITrainable(nn.Module):
@@ -40,6 +54,8 @@ class FluxI2ITrainable(nn.Module):
             torch_dtype=torch.bfloat16,
         )
         self.unet.enable_gradient_checkpointing()
+        # 檢查當前 unet 是否支援 guidance 參數（舊版支援，diffusers 0.30+ 的 schnell 通常不支援）
+        self._accepts_guidance = _flux_unet_accepts_guidance(self.unet)
 
         # ---------- 3) CLIP vision ----------
         self.clip_vision = CLIPVisionModel.from_pretrained(
@@ -95,6 +111,7 @@ class FluxI2ITrainable(nn.Module):
             bias="none",
         )
         self.unet = get_peft_model(self.unet, lora_config)
+        self._accepts_guidance = _flux_unet_accepts_guidance(self.unet)
 
     # --------- stable pack/unpack (CRITICAL FIX) ----------
     def _pack(self, latents):
@@ -168,7 +185,7 @@ class FluxI2ITrainable(nn.Module):
         gamma_warmup_steps=200,
         mix_cartoon_latent=0.35,
         flat_strength=0.35,
-        guidance_scale=3.5,
+        guidance_scale=1.0,
         preview_t=0.2,
         force_t=None,
         return_aux=False,
@@ -256,21 +273,25 @@ class FluxI2ITrainable(nn.Module):
 
         img_ids, txt_ids = self._get_ids(h, w, device)
 
-        v_pred = self.unet(
+        unet_kw = dict(
             hidden_states=x_t,
             encoder_hidden_states=encoder_hidden_states,
             pooled_projections=pooled_projections,
             timestep=t * 1000.0,
             img_ids=img_ids,
             txt_ids=txt_ids,
-            guidance=guidance,
             return_dict=False,
-        )[0]
+        )
+        if self._accepts_guidance:
+            unet_kw["guidance"] = guidance
+        v_pred = self.unet(**unet_kw)[0]
 
         target_v = (noise - packed_latents).float()
         loss = F.mse_loss(v_pred.float(), target_v)
 
         if not torch.isfinite(loss):
+            if return_aux:
+                return None, None, None
             return None, None
 
         # --------- 4) Preview ----------
@@ -284,16 +305,18 @@ class FluxI2ITrainable(nn.Module):
 
             x_tp = x_tp.to(dtype)
 
-            v_p = self.unet(
+            unet_kw_p = dict(
                 hidden_states=x_tp,
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_projections,
                 timestep=t_p * 1000.0,
                 img_ids=img_ids,
                 txt_ids=txt_ids,
-                guidance=guidance,
                 return_dict=False,
-            )[0]
+            )
+            if self._accepts_guidance:
+                unet_kw_p["guidance"] = guidance
+            v_p = self.unet(**unet_kw_p)[0]
 
             x0 = x_tp - t_p.view(-1, 1, 1) * v_p  # [B,N,64]
 

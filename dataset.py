@@ -15,7 +15,11 @@ class CartoonDataset(Dataset):
 
         self.real_names = [f for f in os.listdir(self.real_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
         self.cartoon_names = [f for f in os.listdir(self.cartoon_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
-        
+        if not self.real_names or not self.cartoon_names:
+            raise FileNotFoundError(
+                f"⚠️ 目錄為空！請確保 {self.real_dir} 與 {self.cartoon_dir} 內各有至少一張 .jpg/.png/.jpeg 圖片。"
+            )
+
         self.transform = transforms.Compose([
             # 保持 512 分辨率，FLUX 对 16 整数倍的分辨率支持最好
             transforms.RandomResizedCrop(
@@ -48,5 +52,8 @@ class CartoonDataset(Dataset):
             }
         except Exception as e:
             # 如果某张图坏了，打印一下文件名方便你清理数据集
+            n = self.__len__()
+            if n <= 0:
+                raise
             print(f"❌ 损坏的图像: {real_name} 或 {cartoon_name}, 正在重试...")
-            return self.__getitem__(random.randint(0, self.__len__() - 1))
+            return self.__getitem__(random.randint(0, n - 1))

@@ -54,7 +54,7 @@ def parse_args():
     p.add_argument("--organize", action="store_true", help="单张模式：在 output 所在目录下创建 real/ 与 gen/ 并整理，便于评估。")
     p.add_argument("--t0", type=float, default=0.5, help="Start timestep for ODE.")
     p.add_argument("--steps", type=int, default=15, help="ODE refinement steps.")
-    p.add_argument("--guidance", type=float, default=3.5, help="Guidance scale.")
+    p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it (older diffusers/FLUX). For diffusers>=0.30 + FLUX.1-schnell, 此值會被自動忽略。")
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--run_eval", action="store_true", help="推理并整理后跑 Face-Sim / CLIP Score / FID。")
@@ -65,7 +65,8 @@ def parse_args():
 
 
 def _run_one(model, device, img_tensor, t0, steps, guidance):
-    """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (1,C,H,W) 在 [0,1]。"""
+    """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (C,H,W) 在 [0,1]。"""
+    steps = max(1, int(steps))
     with torch.no_grad():
         latents = model.vae.encode(img_tensor.to(torch.float32)).latent_dist.mode()
         latents = (latents - model.vae.config.shift_factor) * model.scaling_factor
@@ -91,16 +92,19 @@ def _run_one(model, device, img_tensor, t0, steps, guidance):
         for i in range(steps):
             current_t = t0 * (1 - i / steps)
             t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
-            v_pred = model.unet(
+            unet_kw = dict(
                 hidden_states=x_t,
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_projections,
                 timestep=t_tensor * 1000,
                 img_ids=img_ids,
                 txt_ids=txt_ids,
-                guidance=guidance_t,
                 return_dict=False,
-            )[0]
+            )
+            accepts_guidance = getattr(model, "_accepts_guidance", False)
+            if accepts_guidance:
+                unet_kw["guidance"] = guidance_t
+            v_pred = model.unet(**unet_kw)[0]
             v_pred = torch.nan_to_num(v_pred, nan=0.0).clamp(-3.0, 3.0)
             x_t = x_t - v_pred * dt
 
@@ -149,10 +153,20 @@ def main():
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
-        state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-        model.load_state_dict(state, strict=False)
+        if isinstance(ckpt, dict):
+            # 優先載入 LoRA 權重（新格式）
+            if "lora" in ckpt:
+                res = model.unet.load_state_dict(ckpt["lora"], strict=False)
+                print("[LoRA load] missing:", len(res.missing_keys), "unexpected:", len(res.unexpected_keys))
+            # 向後相容舊格式：整個 model_state_dict
+            elif "model_state_dict" in ckpt:
+                model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        else:
+            # 最後退路：當成完整 state_dict 載入
+            model.load_state_dict(ckpt, strict=False)
     model.vae.to(torch.float32)
     model.eval()
+    print(f"[Inference] UNet accepts guidance: {getattr(model, '_accepts_guidance', False)}")
 
     if batch_mode:
         for name in tqdm(image_names, desc="Inference"):

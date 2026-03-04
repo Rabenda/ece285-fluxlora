@@ -24,6 +24,7 @@ import torch
 import torchvision.utils as vutils
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from peft import get_peft_model_state_dict
 
 from dataset import CartoonDataset
 from identity_loss import FaceIdentityLoss
@@ -63,6 +64,7 @@ def parse_args():
     parser.add_argument("--samples_dir", type=str, default="./samples")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="每 N 個 micro-batch 累積梯度後更新一次，等效 batch_size = batch_size * N。")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -114,6 +116,13 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     dataset = CartoonDataset(args.train_dir)
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty. Ensure real/ and cartoon/ each contain at least one image.")
+    if len(dataset) < args.batch_size:
+        raise ValueError(
+            f"Not enough samples for one batch (len(dataset)={len(dataset)}, batch_size={args.batch_size}). "
+            "Use a larger dataset or smaller batch_size."
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -122,7 +131,6 @@ def main():
         pin_memory=args.pin_memory,
         drop_last=True,
     )
-
     fixed_batch = next(iter(dataloader))
     fixed_real = fixed_batch["real"].to(device)
     fixed_cartoon = fixed_batch["cartoon"].to(device)
@@ -133,16 +141,27 @@ def main():
         if ckpt_path:
             print(f"Resuming from: {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location="cpu")
-            model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            global_step = ckpt.get("global_step", 0)
+            if isinstance(ckpt, dict):
+                # 新格式：僅保存 LoRA 權重在 "lora" key 下
+                if "lora" in ckpt:
+                    model.unet.load_state_dict(ckpt["lora"], strict=False)
+                # 向後相容舊格式："model_state_dict"
+                elif "model_state_dict" in ckpt:
+                    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+                if "optimizer_state_dict" in ckpt:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                global_step = ckpt.get("global_step", 0)
 
-    print(f"Training on {device}, autocast={args.use_autocast}")
+    accum_steps = max(1, args.gradient_accumulation_steps)
+    print(f"Training on {device}, autocast={args.use_autocast}, gradient_accumulation_steps={accum_steps} (effective batch = {args.batch_size * accum_steps})")
+    last_rf, last_id, last_lam, last_total = "0.0000", "0.0000", "0.0000", "0.0000"
     for epoch in range(args.epochs):
         model.train()
+        step_in_accum = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
         for batch in pbar:
-            optimizer.zero_grad(set_to_none=True)
+            if step_in_accum == 0:
+                optimizer.zero_grad(set_to_none=True)
 
             real_imgs = batch["real"].to(device, non_blocking=True)
             cartoon_imgs = batch["cartoon"].to(device, non_blocking=True)
@@ -153,12 +172,21 @@ def main():
             target_image = cartoon_imgs
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
-                rf_loss, preview, aux = model(
-                    target_image=target_image,
-                    cond_image=cond_image,
-                    gamma=gamma,
-                    return_aux=True,
-                )
+                if args.stage == "stage3":
+                    rf_loss, preview, aux = model(
+                        target_image=target_image,
+                        cond_image=cond_image,
+                        gamma=gamma,
+                        return_aux=True,
+                    )
+                else:
+                    rf_loss, preview = model(
+                        target_image=target_image,
+                        cond_image=cond_image,
+                        gamma=gamma,
+                        return_aux=False,
+                    )
+                    aux = None
 
                 if rf_loss is None or preview is None or (not torch.isfinite(rf_loss)):
                     continue
@@ -169,46 +197,62 @@ def main():
                 if args.stage == "stage3":
                     sampled_t = float(aux["sampled_t"].mean().detach().item())
                     lam = lambda_schedule(sampled_t, args.lambda0, args.lambda_p)
-                    id_loss = id_criterion(real_imgs, preview)
+                    with torch.cuda.amp.autocast(enabled=False):
+                        id_loss = id_criterion(real_imgs.float(), preview.float())
                     total_loss = rf_loss + lam * id_loss
 
             if not torch.isfinite(total_loss):
                 continue
 
-            total_loss.backward()
+            (total_loss / accum_steps).backward()
+            step_in_accum += 1
+
+            if step_in_accum == accum_steps:
+                if args.stage == "stage3" and global_step < 3:
+                    for name, param in model.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            print(f"[Stage3 grad check] {name} grad mean: {param.grad.abs().mean().item():.6f}")
+                            break
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                optimizer.step()
+                step_in_accum = 0
+                global_step += 1
+
+                if global_step % args.sample_interval_step == 0:
+                    model.eval()
+                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
+                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma)
+                        if preview is not None:
+                            save_preview_images(preview, os.path.join(args.samples_dir, f"step_{global_step:06d}.png"))
+                    model.train()
+
+                if global_step > 0 and global_step % args.save_interval_step == 0:
+                    ckpt_path = os.path.join(args.checkpoint_root, f"full_step_{global_step:06d}.pt")
+                    lora_state = get_peft_model_state_dict(model.unet)
+                    torch.save(
+                        {
+                            "global_step": global_step,
+                            "lora": lora_state,
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "stage": args.stage,
+                            "lambda0": args.lambda0,
+                            "lambda_p": args.lambda_p,
+                        },
+                        ckpt_path,
+                    )
+
+                last_rf = f"{rf_loss.item():.4f}"
+                last_id = f"{id_loss.item():.4f}"
+                last_lam = f"{lam:.4f}"
+                last_total = f"{total_loss.item():.4f}"
+                pbar.set_postfix(rf=last_rf, id=last_id, lam=last_lam, total=last_total, step=global_step, accum=f"0/{accum_steps}")
+            else:
+                pbar.set_postfix(rf=last_rf, id=last_id, lam=last_lam, total=last_total, step=global_step, accum=f"{step_in_accum}/{accum_steps}")
+
+        if step_in_accum > 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
             optimizer.step()
-
-            pbar.set_postfix(
-                rf=f"{rf_loss.item():.4f}",
-                id=f"{id_loss.item():.4f}",
-                lam=f"{lam:.4f}",
-                total=f"{total_loss.item():.4f}",
-                step=global_step,
-            )
-
-            if global_step % args.sample_interval_step == 0:
-                model.eval()
-                with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
-                    _, preview = model(fixed_cartoon, fixed_real, gamma=gamma)
-                    if preview is not None:
-                        save_preview_images(preview, os.path.join(args.samples_dir, f"step_{global_step:06d}.png"))
-                model.train()
-
-            if global_step > 0 and global_step % args.save_interval_step == 0:
-                ckpt_path = os.path.join(args.checkpoint_root, f"full_step_{global_step:06d}.pt")
-                torch.save(
-                    {
-                        "global_step": global_step,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "stage": args.stage,
-                        "lambda0": args.lambda0,
-                        "lambda_p": args.lambda_p,
-                    },
-                    ckpt_path,
-                )
-
+            optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
     print("Training finished.")
