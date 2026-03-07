@@ -95,6 +95,10 @@ class FluxI2ITrainable(nn.Module):
         self.register_buffer("cartoon_proto_low", torch.zeros(1, 16, self.proto_pool, self.proto_pool))
         self.register_buffer("proto_initialized", torch.zeros((), dtype=torch.bool))
 
+        self._bad_print_count = 0
+        self._spike_print_count = 0
+        self._last_spike_info = None
+
         # blur kernel (depthwise 3x3)
         k = torch.tensor([1., 2., 1.], dtype=torch.float32)
         k = (k[:, None] * k[None, :])
@@ -182,7 +186,6 @@ class FluxI2ITrainable(nn.Module):
         cond_image=None,   # real photo / identity source
         gamma=3.0,
         proto_momentum=0.99,
-        gamma_warmup_steps=200,
         mix_cartoon_latent=0.35,
         flat_strength=0.35,
         guidance_scale=1.0,
@@ -196,9 +199,6 @@ class FluxI2ITrainable(nn.Module):
         if cond_image is None:
             cond_image = target_image
 
-        if self.training:
-            self.global_step += 1
-
         # --------- 1) CLIP encoding ----------
         with torch.no_grad():
             x = (cond_image + 1.0) / 2.0
@@ -208,9 +208,10 @@ class FluxI2ITrainable(nn.Module):
             vlm_feats = clip_outputs.last_hidden_state   # [B,257,1024]
             vlm_pooled = clip_outputs.pooler_output      # [B,1024]
 
-        # Condition injection
+        # Condition injection（拆出 vlm_proj_out 便于 spike 时打印幅值）
+        vlm_proj_out = self.vlm_proj(vlm_feats)
         encoder_hidden_states = torch.zeros((bsz, 512, 4096), device=device, dtype=dtype)
-        encoder_hidden_states[:, :257, :] = self.vlm_proj(vlm_feats)
+        encoder_hidden_states[:, :257, :] = vlm_proj_out
 
         pooled_projections = self.pooled_proj(vlm_pooled)  # [B,768]
         guidance = torch.full((bsz,), float(guidance_scale), device=device, dtype=dtype)
@@ -235,13 +236,8 @@ class FluxI2ITrainable(nn.Module):
             bias_up = F.interpolate(bias_low, size=z_real.shape[-2:], mode="bilinear", align_corners=False)
             bias_up = self._blur_latent(bias_up)
 
-            # gamma warmup
-            if self.training and gamma_warmup_steps > 0:
-                s = int(self.global_step.item())
-                warm = min(1.0, s / float(gamma_warmup_steps))
-                gamma_eff = gamma * warm
-            else:
-                gamma_eff = gamma
+            # gamma 调度只由训练脚本外层控制，此处不再做内层 warmup
+            gamma_eff = gamma
 
             # domain pull + flatten
             z_mix = (1.0 - mix_cartoon_latent) * z_real + mix_cartoon_latent * z_cartoon
@@ -286,13 +282,53 @@ class FluxI2ITrainable(nn.Module):
             unet_kw["guidance"] = guidance
         v_pred = self.unet(**unet_kw)[0]
 
+        v_pred_f = v_pred.float()
         target_v = (noise - packed_latents).float()
-        loss = F.mse_loss(v_pred.float(), target_v)
+        loss = F.mse_loss(v_pred_f, target_v)
+
+        def _print_diagnostics(tag):
+            print(f"[{tag}]")
+            print("  t mean:", t.float().mean().item())
+            print("  gamma:", float(gamma), "gamma_eff:", float(gamma_eff))
+            print("  packed_latents absmax:", packed_latents.float().abs().max().item())
+            print("  x_t absmax:", x_t.float().abs().max().item())
+            print("  v_pred absmax:", v_pred_f.abs().max().item(), "mean abs:", v_pred_f.abs().mean().item())
+            print("  target_v absmax:", target_v.abs().max().item(), "mean abs:", target_v.abs().mean().item())
+            print("  vlm_proj_out absmax:", vlm_proj_out.float().abs().max().item())
+            print("  enc_hidden absmax:", encoder_hidden_states.float().abs().max().item())
+            print("  pooled_proj absmax:", pooled_projections.float().abs().max().item())
 
         if not torch.isfinite(loss):
+            self._last_spike_info = {
+                "rf_loss": float("nan"),
+                "v_pred_absmax": v_pred_f.abs().max().item(),
+                "target_v_absmax": target_v.abs().max().item(),
+                "t_mean": t.float().mean().item(),
+                "vlm_proj_out_absmax": vlm_proj_out.float().abs().max().item(),
+                "enc_hidden_absmax": encoder_hidden_states.float().abs().max().item(),
+                "pooled_proj_absmax": pooled_projections.float().abs().max().item(),
+                "trigger": "non_finite",
+            }
+            if self._bad_print_count < 5:
+                _print_diagnostics("BAD non-finite loss")
+                self._bad_print_count += 1
             if return_aux:
                 return None, None, None
             return None, None
+
+        if loss.item() > 1000.0:
+            if self._spike_print_count < 5:
+                _print_diagnostics("SPIKE loss > 1000")
+                self._spike_print_count += 1
+            self._last_spike_info = {
+                "rf_loss": loss.item(),
+                "v_pred_absmax": v_pred_f.abs().max().item(),
+                "target_v_absmax": target_v.abs().max().item(),
+                "t_mean": t.float().mean().item(),
+                "trigger": "loss",
+            }
+        else:
+            self._last_spike_info = None
 
         # --------- 4) Preview ----------
         # Stage3 需要 preview 带梯度，使 L_ID 能回传到 LoRA；其余情况用 no_grad 省显存

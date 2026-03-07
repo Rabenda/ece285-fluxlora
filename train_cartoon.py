@@ -107,6 +107,30 @@ def main():
             writer = csv.writer(f)
             writer.writerow(["step", "epoch", "rf_loss", "id_loss", "total_loss", "lam", "gamma", "lr", "grad_norm"])
 
+    spike_log_path = os.path.join(args.checkpoint_root, "spike_log.csv")
+    if not os.path.exists(spike_log_path):
+        with open(spike_log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "batch_idx", "rf_loss", "v_pred_absmax", "target_v_absmax", "t_mean", "trigger", "grad_norm", "vlm_proj_out_absmax", "enc_hidden_absmax", "pooled_proj_absmax"])
+
+    def _write_spike_row(info, step, batch_idx, grad_norm_str=""):
+        rf = info.get("rf_loss")
+        rf_str = "nan" if (isinstance(rf, float) and not (rf == rf)) else (round(rf, 6) if isinstance(rf, (int, float)) else rf)
+        row = [
+            step, batch_idx,
+            rf_str,
+            round(info.get("v_pred_absmax", 0), 6),
+            round(info.get("target_v_absmax", 0), 6),
+            round(info.get("t_mean", 0), 6),
+            info.get("trigger", "loss"),
+            grad_norm_str,
+        ]
+        for k in ("vlm_proj_out_absmax", "enc_hidden_absmax", "pooled_proj_absmax"):
+            v = info.get(k)
+            row.append(round(v, 6) if isinstance(v, (int, float)) and (v == v) else ("" if v is None else "nan"))
+        with open(spike_log_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+
     print(f"Loading model for {args.stage} ...")
     model = FluxI2ITrainable().to(device)
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
@@ -170,6 +194,7 @@ def main():
     accum_steps = max(1, args.gradient_accumulation_steps)
     print(f"Training on {device}, autocast={args.use_autocast}, gradient_accumulation_steps={accum_steps} (effective batch = {args.batch_size * accum_steps})")
     last_rf, last_id, last_lam, last_total = "0.0000", "0.0000", "0.0000", "0.0000"
+    rf_acc = id_acc = total_acc = lam_acc = gamma_acc = count_acc = 0.0
     for epoch in range(args.epochs):
         model.train()
         step_in_accum = 0
@@ -177,6 +202,7 @@ def main():
         for batch in pbar:
             if step_in_accum == 0:
                 optimizer.zero_grad(set_to_none=True)
+                rf_acc = id_acc = total_acc = lam_acc = gamma_acc = count_acc = 0.0
 
             real_imgs = batch["real"].to(device, non_blocking=True)
             cartoon_imgs = batch["cartoon"].to(device, non_blocking=True)
@@ -204,6 +230,10 @@ def main():
                     aux = None
 
                 if rf_loss is None or preview is None or (not torch.isfinite(rf_loss)):
+                    spike_info = getattr(model, "_last_spike_info", None)
+                    if spike_info is not None:
+                        _write_spike_row(spike_info, global_step, step_in_accum, "")
+                        model._last_spike_info = None
                     continue
 
                 total_loss = rf_loss
@@ -219,8 +249,19 @@ def main():
             if not torch.isfinite(total_loss):
                 continue
 
+            spike_info = getattr(model, "_last_spike_info", None)
+            if spike_info is not None:
+                _write_spike_row(spike_info, global_step, step_in_accum, "")
+                model._last_spike_info = None
+
             (total_loss / accum_steps).backward()
             step_in_accum += 1
+            rf_acc += rf_loss.item()
+            id_acc += id_loss.item()
+            total_acc += total_loss.item()
+            lam_acc += lam
+            gamma_acc += gamma
+            count_acc += 1.0
 
             if step_in_accum == accum_steps:
                 if args.stage == "stage3" and global_step < 3:
@@ -229,20 +270,38 @@ def main():
                             print(f"[Stage3 grad check] {name} grad mean: {param.grad.abs().mean().item():.6f}")
                             break
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                if grad_norm.item() > 10000.0:
+                    with open(spike_log_path, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            global_step + 1,
+                            accum_steps - 1,
+                            round(rf_avg, 6),
+                            -1, -1, -1,
+                            "grad_norm",
+                            round(grad_norm.item(), 6),
+                            "", "", "",
+                        ])
                 optimizer.step()
                 step_in_accum = 0
                 global_step += 1
 
+                n = max(1, int(count_acc))
+                rf_avg = rf_acc / n
+                id_avg = id_acc / n
+                total_avg = total_acc / n
+                lam_avg = lam_acc / n
+                gamma_avg = gamma_acc / n
                 with open(csv_path, "a", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow([
                         global_step,
                         epoch + 1,
-                        round(rf_loss.item(), 6),
-                        round(id_loss.item(), 6),
-                        round(total_loss.item(), 6),
-                        round(lam, 6),
-                        round(gamma, 6),
+                        round(rf_avg, 6),
+                        round(id_avg, 6),
+                        round(total_avg, 6),
+                        round(lam_avg, 6),
+                        round(gamma_avg, 6),
                         optimizer.param_groups[0]["lr"],
                         round(grad_norm.item(), 6),
                     ])
@@ -288,10 +347,10 @@ def main():
                         ckpt_path,
                     )
 
-                last_rf = f"{rf_loss.item():.4f}"
-                last_id = f"{id_loss.item():.4f}"
-                last_lam = f"{lam:.4f}"
-                last_total = f"{total_loss.item():.4f}"
+                last_rf = f"{rf_avg:.4f}"
+                last_id = f"{id_avg:.4f}"
+                last_lam = f"{lam_avg:.4f}"
+                last_total = f"{total_avg:.4f}"
                 pbar.set_postfix(rf=last_rf, id=last_id, lam=last_lam, total=last_total, step=global_step, accum=f"0/{accum_steps}")
             else:
                 pbar.set_postfix(rf=last_rf, id=last_id, lam=last_lam, total=last_total, step=global_step, accum=f"{step_in_accum}/{accum_steps}")
@@ -301,16 +360,22 @@ def main():
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            n = max(1, int(count_acc))
+            rf_avg = rf_acc / n
+            id_avg = id_acc / n
+            total_avg = total_acc / n
+            lam_avg = lam_acc / n
+            gamma_avg = gamma_acc / n
             with open(csv_path, "a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     global_step,
                     epoch + 1,
-                    round(rf_loss.item(), 6),
-                    round(id_loss.item(), 6),
-                    round(total_loss.item(), 6),
-                    round(lam, 6),
-                    round(gamma, 6),
+                    round(rf_avg, 6),
+                    round(id_avg, 6),
+                    round(total_avg, 6),
+                    round(lam_avg, 6),
+                    round(gamma_avg, 6),
                     optimizer.param_groups[0]["lr"],
                     round(grad_norm.item(), 6),
                 ])
