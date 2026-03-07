@@ -17,6 +17,7 @@ python train_cartoon.py --stage stage3 --train_dir ./data --resume
 python train_cartoon.py --stage stage3 --train_dir ./data --sanity_check
 """
 import argparse
+import csv
 import glob
 import os
 
@@ -28,6 +29,7 @@ from peft import get_peft_model_state_dict
 
 from dataset import CartoonDataset
 from identity_loss import FaceIdentityLoss
+from inference import _run_one as run_inference_one
 from models.flux_i2i_trainable import FluxI2ITrainable
 
 
@@ -71,8 +73,11 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--save_interval_step", type=int, default=500)
-    parser.add_argument("--sample_interval_step", type=int, default=20)
+    parser.add_argument("--save_interval_step", type=int, default=50)
+    parser.add_argument("--preview_interval_step", type=int, default=50, help="每 N 步存一次 training preview（preview_step_*.png）。")
+    parser.add_argument("--infer_interval_step", type=int, default=50, help="每 N 步用真实多步推理存一次 infer_step_*.png 与 compare_step_*.png。")
+    parser.add_argument("--sample_t0", type=float, default=0.5, help="infer sample 的 ODE 起始 t0。")
+    parser.add_argument("--sample_steps", type=int, default=20, help="infer sample 的 ODE 步数。")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--gamma_start", type=float, default=2.0)
@@ -95,6 +100,12 @@ def main():
 
     ensure_dir(args.samples_dir)
     ensure_dir(args.checkpoint_root)
+
+    csv_path = os.path.join(args.checkpoint_root, "train_metrics.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "epoch", "rf_loss", "id_loss", "total_loss", "lam", "gamma", "lr", "grad_norm"])
 
     print(f"Loading model for {args.stage} ...")
     model = FluxI2ITrainable().to(device)
@@ -148,6 +159,10 @@ def main():
                 # 向後相容舊格式："model_state_dict"
                 elif "model_state_dict" in ckpt:
                     model.load_state_dict(ckpt["model_state_dict"], strict=False)
+                if "vlm_proj" in ckpt:
+                    model.vlm_proj.load_state_dict(ckpt["vlm_proj"])
+                if "pooled_proj" in ckpt:
+                    model.pooled_proj.load_state_dict(ckpt["pooled_proj"])
                 if "optimizer_state_dict" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 global_step = ckpt.get("global_step", 0)
@@ -213,17 +228,47 @@ def main():
                         if param.requires_grad and param.grad is not None:
                             print(f"[Stage3 grad check] {name} grad mean: {param.grad.abs().mean().item():.6f}")
                             break
-                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
                 step_in_accum = 0
                 global_step += 1
 
-                if global_step % args.sample_interval_step == 0:
+                with open(csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        global_step,
+                        epoch + 1,
+                        round(rf_loss.item(), 6),
+                        round(id_loss.item(), 6),
+                        round(total_loss.item(), 6),
+                        round(lam, 6),
+                        round(gamma, 6),
+                        optimizer.param_groups[0]["lr"],
+                        round(grad_norm.item(), 6),
+                    ])
+
+                # 1) Training preview（单步、偏暗，仅作 debug）
+                if global_step % args.preview_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
                         _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma)
                         if preview is not None:
-                            save_preview_images(preview, os.path.join(args.samples_dir, f"step_{global_step:06d}.png"))
+                            save_preview_images(preview, os.path.join(args.samples_dir, f"preview_step_{global_step:06d}.png"))
+                    model.train()
+
+                # 2) 真实多步推理 sample + 对比图（real | preview | infer）
+                if global_step > 0 and global_step % args.infer_interval_step == 0:
+                    model.eval()
+                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
+                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma)
+                    infer_img = run_inference_one(model, device, fixed_real, args.sample_t0, args.sample_steps, 1.0)
+                    if preview is not None:
+                        real_01 = (fixed_real[0].float().cpu() + 1.0) / 2.0
+                        preview_01 = (preview[0].float().cpu().clamp(-1, 1) + 1.0) / 2.0
+                        infer_01 = infer_img  # (C,H,W) already [0,1]
+                        compare = torch.stack([real_01, preview_01, infer_01], dim=0)
+                        vutils.save_image(compare, os.path.join(args.samples_dir, f"compare_step_{global_step:06d}.png"), nrow=3)
+                    vutils.save_image(infer_img.unsqueeze(0), os.path.join(args.samples_dir, f"infer_step_{global_step:06d}.png"))
                     model.train()
 
                 if global_step > 0 and global_step % args.save_interval_step == 0:
@@ -233,6 +278,8 @@ def main():
                         {
                             "global_step": global_step,
                             "lora": lora_state,
+                            "vlm_proj": model.vlm_proj.state_dict(),
+                            "pooled_proj": model.pooled_proj.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "stage": args.stage,
                             "lambda0": args.lambda0,
@@ -250,10 +297,41 @@ def main():
                 pbar.set_postfix(rf=last_rf, id=last_id, lam=last_lam, total=last_total, step=global_step, accum=f"{step_in_accum}/{accum_steps}")
 
         if step_in_accum > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    global_step,
+                    epoch + 1,
+                    round(rf_loss.item(), 6),
+                    round(id_loss.item(), 6),
+                    round(total_loss.item(), 6),
+                    round(lam, 6),
+                    round(gamma, 6),
+                    optimizer.param_groups[0]["lr"],
+                    round(grad_norm.item(), 6),
+                ])
+
+    # 训练结束保存最终 checkpoint，避免最后一轮未对齐 save_interval 而漏存
+    final_ckpt_path = os.path.join(args.checkpoint_root, f"full_step_{global_step:06d}_final.pt")
+    lora_state = get_peft_model_state_dict(model.unet)
+    torch.save(
+        {
+            "global_step": global_step,
+            "lora": lora_state,
+            "vlm_proj": model.vlm_proj.state_dict(),
+            "pooled_proj": model.pooled_proj.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "stage": args.stage,
+            "lambda0": args.lambda0,
+            "lambda_p": args.lambda_p,
+        },
+        final_ckpt_path,
+    )
+    print(f"Final checkpoint saved to: {final_ckpt_path}")
 
     print("Training finished.")
 

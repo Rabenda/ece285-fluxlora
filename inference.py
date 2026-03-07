@@ -161,6 +161,10 @@ def main():
             # 向後相容舊格式：整個 model_state_dict
             elif "model_state_dict" in ckpt:
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if "vlm_proj" in ckpt:
+                model.vlm_proj.load_state_dict(ckpt["vlm_proj"])
+            if "pooled_proj" in ckpt:
+                model.pooled_proj.load_state_dict(ckpt["pooled_proj"])
         else:
             # 最後退路：當成完整 state_dict 載入
             model.load_state_dict(ckpt, strict=False)
