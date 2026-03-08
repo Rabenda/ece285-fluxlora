@@ -78,7 +78,7 @@ def _run_one(model, device, img_tensor, t0, steps, guidance, single_step=False, 
         noise = torch.randn_like(x_start)
         x_t = (1.0 - t_use) * x_start + t_use * noise
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(device == "cuda")):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
             # 和训练时完全一致的 CLIP 预处理与 conditioning 路径
             clip_in = F.interpolate((img_tensor + 1.0) / 2.0, size=(224, 224), mode="bilinear", align_corners=False)
             clip_in = (clip_in - model.clip_mean.to(img_tensor.device)) / model.clip_std.to(img_tensor.device)
@@ -97,44 +97,49 @@ def _run_one(model, device, img_tensor, t0, steps, guidance, single_step=False, 
         encoder_hidden_states = torch.zeros((1, 512, 4096), device=device, dtype=torch.bfloat16)
         encoder_hidden_states[:, :257, :] = vlm_proj_out.to(torch.bfloat16)
         img_ids, txt_ids = model._get_ids(h, w, device)
-        guidance_t = torch.full((1,), float(guidance), device=device, dtype=torch.bfloat16)
+        # FLUX.1-schnell 蒸馏模型：推理时 guidance 固定 0.0，否则出图会崩
+        guidance_t = torch.full((1,), 0.0, device=device, dtype=torch.bfloat16)
 
     with torch.no_grad():
         if single_step:
             # 实验 A：单步 x0 = x_t - t * v_pred（与训练 preview 同款）
             t_tensor = torch.full((1,), t_use, device=device, dtype=torch.bfloat16)
+            # diffusers FLUX 内部已做时间步缩放，不再 * 1000
+            timestep = t_tensor.to(torch.bfloat16)
             unet_kw = dict(
-                hidden_states=x_t,
-                encoder_hidden_states=encoder_hidden_states,
-                pooled_projections=pooled_projections,
-                timestep=t_tensor * 1000,
-                img_ids=img_ids,
-                txt_ids=txt_ids,
+                hidden_states=x_t.to(torch.bfloat16),
+                encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
+                pooled_projections=pooled_projections.to(torch.bfloat16),
+                timestep=timestep,
+                img_ids=img_ids.to(torch.bfloat16),
+                txt_ids=txt_ids.to(torch.bfloat16),
                 return_dict=False,
             )
             if getattr(model, "_accepts_guidance", False):
-                unet_kw["guidance"] = guidance_t
+                unet_kw["guidance"] = guidance_t.to(torch.bfloat16)
             v_pred = model.unet(**unet_kw)[0]
-            v_pred = torch.nan_to_num(v_pred, nan=0.0).clamp(-3.0, 3.0)
+            v_pred = torch.nan_to_num(v_pred, nan=0.0)
             x_t = x_t - t_tensor.view(-1, 1, 1) * v_pred
         else:
             dt = t0 / steps
             for i in range(steps):
                 current_t = t0 * (1 - i / steps)
                 t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
+                # diffusers FLUX 内部已做时间步缩放，不再 * 1000
+                timestep = t_tensor.to(torch.bfloat16)
                 unet_kw = dict(
-                    hidden_states=x_t,
-                    encoder_hidden_states=encoder_hidden_states,
-                    pooled_projections=pooled_projections,
-                    timestep=t_tensor * 1000,
-                    img_ids=img_ids,
-                    txt_ids=txt_ids,
+                    hidden_states=x_t.to(torch.bfloat16),
+                    encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
+                    pooled_projections=pooled_projections.to(torch.bfloat16),
+                    timestep=timestep,
+                    img_ids=img_ids.to(torch.bfloat16),
+                    txt_ids=txt_ids.to(torch.bfloat16),
                     return_dict=False,
                 )
                 if getattr(model, "_accepts_guidance", False):
-                    unet_kw["guidance"] = guidance_t
+                    unet_kw["guidance"] = guidance_t.to(torch.bfloat16)
                 v_pred = model.unet(**unet_kw)[0]
-                v_pred = torch.nan_to_num(v_pred, nan=0.0).clamp(-3.0, 3.0)
+                v_pred = torch.nan_to_num(v_pred, nan=0.0)
                 x_t = x_t - v_pred * dt
 
     with torch.no_grad():

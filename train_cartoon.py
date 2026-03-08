@@ -328,7 +328,7 @@ def main():
                     model.eval()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
                         _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
-                    infer_img = run_inference_one(model, device, fixed_real, args.sample_t0, args.sample_steps, 1.0)
+                        infer_img = run_inference_one(model, device, fixed_real, args.sample_t0, args.sample_steps, 1.0)
                     if preview is not None:
                         real_01 = (fixed_real[0].float().cpu() + 1.0) / 2.0
                         preview_01 = (preview[0].float().cpu().clamp(-1, 1) + 1.0) / 2.0
