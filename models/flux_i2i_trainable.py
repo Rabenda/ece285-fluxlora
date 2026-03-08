@@ -63,9 +63,13 @@ class FluxI2ITrainable(nn.Module):
         ).to("cuda", dtype=torch.bfloat16)
         self.clip_vision.requires_grad_(False)
 
-        # Projection layers
+        # Projection layers（小初始化 + 前向里 LayerNorm + 0.01， conditioning 更稳）
         self.vlm_proj = nn.Linear(1024, 4096).to("cuda", dtype=torch.bfloat16)
+        nn.init.normal_(self.vlm_proj.weight, std=1e-5)
+        nn.init.constant_(self.vlm_proj.bias, 0.0)
         self.pooled_proj = nn.Linear(1024, 768).to("cuda", dtype=torch.bfloat16)
+        nn.init.normal_(self.pooled_proj.weight, std=1e-5)
+        nn.init.constant_(self.pooled_proj.bias, 0.0)
 
         # ---------- 4) Load VAE ----------
         pipe = FluxPipeline.from_pretrained(
