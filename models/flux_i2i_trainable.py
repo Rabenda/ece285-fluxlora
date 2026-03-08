@@ -40,17 +40,17 @@ class FluxI2ITrainable(nn.Module):
         self.register_buffer("global_step", torch.zeros((), dtype=torch.long), persistent=True)
 
         # ---------- 1) 4-bit quant config ----------
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+        # quant_config = BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_quant_type="nf4",
+        #     bnb_4bit_compute_dtype=torch.bfloat16,
+        # )
 
         # ---------- 2) Load FLUX transformer ----------
         self.unet = FluxTransformer2DModel.from_pretrained(
             model_id,
             subfolder="transformer",
-            quantization_config=quant_config,
+            # quantization_config=quant_config,
             torch_dtype=torch.bfloat16,
         )
         self.unet.enable_gradient_checkpointing()
