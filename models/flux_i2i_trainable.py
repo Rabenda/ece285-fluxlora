@@ -149,15 +149,16 @@ class FluxI2ITrainable(nn.Module):
         return x
 
     def _get_ids(self, h, w, device):
-        """
-        img_ids must align with token grid: (H//2, W//2) tokens.
-        """
         h2, w2 = h // 2, w // 2
         h_range = torch.arange(h2, device=device)
         w_range = torch.arange(w2, device=device)
         grid_y, grid_x = torch.meshgrid(h_range, w_range, indexing="ij")
+        
+        # 修复位置编码：索引1才是高度，索引2才是宽度！
         img_ids = torch.zeros((h2, w2, 3), device=device)
-        img_ids[..., 0], img_ids[..., 1] = grid_y, grid_x
+        img_ids[..., 1] = grid_y 
+        img_ids[..., 2] = grid_x 
+        
         img_ids = img_ids.view(-1, 3).to(torch.bfloat16)
         txt_ids = torch.zeros((512, 3), device=device, dtype=torch.bfloat16)
         return img_ids, txt_ids
