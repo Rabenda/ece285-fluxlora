@@ -16,10 +16,22 @@ __pycache__/
 data/real/
 data/cartoon/
 data/inference/
+data_processed/
+data_sucess_processed/
+processed_data/
+data_download/
+**/data_processed/
+**/data_sucess_processed/
+**/processed_data/
+**/data_download/
 checkpoints/
 checkpoints_stage*/
 samples/
 samples_*/
+
+# Large data / metadata (download separately)
+ffhq-dataset-v2.json
+**/ffhq-dataset-v2.json
 
 # Model weights & large binaries
 *.pt
