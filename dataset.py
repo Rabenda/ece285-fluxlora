@@ -83,9 +83,9 @@ class CartoonDataset(Dataset):
             if self.use_pairs_csv:
                 real_name, cartoon_name = self.pairs[idx % len(self.pairs)]
             else:
-                # fallback 模式：两边都按 index 循环，cartoon 不再完全 random.choice
+                # fallback：real 按 index，cartoon 随机抽，适合 unpaired style transfer
                 real_name = self.real_names[idx % len(self.real_names)]
-                cartoon_name = self.cartoon_names[idx % len(self.cartoon_names)]
+                cartoon_name = random.choice(self.cartoon_names)
 
             real_img = Image.open(os.path.join(self.real_dir, real_name)).convert("RGB")
             cartoon_img = Image.open(os.path.join(self.cartoon_dir, cartoon_name)).convert("RGB")
@@ -105,7 +105,7 @@ class CartoonDataset(Dataset):
                     real_name, cartoon_name = self.pairs[retry_idx % len(self.pairs)]
                 else:
                     real_name = self.real_names[retry_idx % len(self.real_names)]
-                    cartoon_name = self.cartoon_names[retry_idx % len(self.cartoon_names)]
+                    cartoon_name = random.choice(self.cartoon_names)
                 real_img = Image.open(os.path.join(self.real_dir, real_name)).convert("RGB")
                 cartoon_img = Image.open(os.path.join(self.cartoon_dir, cartoon_name)).convert("RGB")
                 return {"real": self.transform(real_img), "cartoon": self.transform(cartoon_img)}

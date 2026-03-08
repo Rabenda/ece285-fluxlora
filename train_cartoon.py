@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="每 N 個 micro-batch 累積梯度後更新一次，等效 batch_size = batch_size * N。")
-    parser.add_argument("--lr", type=float, default=1e-5, help="学习率；新实验 A 建议 1e-5。")
+    parser.add_argument("--lr", type=float, default=5e-6, help="学习率；4bit+LoRA+accum 建议 5e-6，仍不稳可试 2e-6。")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -83,12 +83,13 @@ def parse_args():
     parser.add_argument("--gamma_start", type=float, default=0.0, help="gamma 调度起点；新实验 A 建议 0.0。")
     parser.add_argument("--gamma_end", type=float, default=0.3, help="gamma 调度终点；新实验 A 建议 0.3。")
     parser.add_argument("--gamma_warmup_steps", type=int, default=300, help="gamma warmup 步数。")
-    parser.add_argument("--mix_cartoon_latent", type=float, default=0.6, help="target_latents 中 cartoon 混合比例，z_mix = (1-m)*z_real + m*z_cartoon。新实验 A 建议 0.6。")
+    parser.add_argument("--mix_cartoon_latent", type=float, default=0.6, help="target 中 cartoon 混合比例；0.6 让 target 更明确，利于稳定。")
     parser.add_argument("--stage", type=str, default="stage3", choices=["stage2", "stage3"], help="stage2: LoRA only; stage3: LoRA + identity loss.")
     parser.add_argument("--lambda0", type=float, default=0.6, help="Identity loss base weight in stage3.")
     parser.add_argument("--lambda_p", type=float, default=2.0, help="Time-dependent exponent in stage3.")
     parser.add_argument("--use_autocast", action="store_true")
     parser.add_argument("--sanity_check", action="store_true", help="训练前跑一次环境/模型自检；未通过则退出。默认关闭。")
+    parser.add_argument("--train_projection", action="store_true", help="若指定则同时训练 vlm_proj/pooled_proj；默认仅训 LoRA 更稳。")
     return parser.parse_args()
 
 
@@ -135,6 +136,10 @@ def main():
     print(f"Loading model for {args.stage} ...")
     model = FluxI2ITrainable().to(device)
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
+    if not args.train_projection:
+        model.vlm_proj.requires_grad_(False)
+        model.pooled_proj.requires_grad_(False)
+        print("Frozen vlm_proj and pooled_proj (train LoRA only). Use --train_projection to unfreeze.")
 
     # 可选：环境自检，未通过则直接退出
     if args.sanity_check:
@@ -213,7 +218,7 @@ def main():
             cond_image = real_imgs
             target_image = cartoon_imgs
 
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
                 if args.stage == "stage3":
                     rf_loss, preview, aux = model(
                         target_image=target_image,
@@ -245,7 +250,7 @@ def main():
                 if args.stage == "stage3":
                     sampled_t = float(aux["sampled_t"].mean().detach().item())
                     lam = lambda_schedule(sampled_t, args.lambda0, args.lambda_p)
-                    with torch.cuda.amp.autocast(enabled=False):
+                    with torch.amp.autocast("cuda", enabled=False):
                         id_loss = id_criterion(real_imgs.float(), preview.float())
                     total_loss = rf_loss + lam * id_loss
 
@@ -312,7 +317,7 @@ def main():
                 # 1) Training preview（单步、偏暗，仅作 debug）
                 if global_step % args.preview_interval_step == 0:
                     model.eval()
-                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
                         _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
                         if preview is not None:
                             save_preview_images(preview, os.path.join(args.samples_dir, f"preview_step_{global_step:06d}.png"))
@@ -321,7 +326,7 @@ def main():
                 # 2) 真实多步推理 sample + 对比图（real | preview | infer）
                 if global_step > 0 and global_step % args.infer_interval_step == 0:
                     model.eval()
-                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
                         _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
                     infer_img = run_inference_one(model, device, fixed_real, args.sample_t0, args.sample_steps, 1.0)
                     if preview is not None:
