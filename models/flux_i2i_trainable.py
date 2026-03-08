@@ -209,7 +209,7 @@ class FluxI2ITrainable(nn.Module):
             vlm_pooled = clip_outputs.pooler_output      # [B,1024]
 
         # Condition injection（拆出 vlm_proj_out 便于 spike 时打印幅值）
-        vlm_proj_out = self.vlm_proj(vlm_feats)
+        vlm_proj_out = self.vlm_proj(vlm_feats) * 0.1 # for debug
         encoder_hidden_states = torch.zeros((bsz, 512, 4096), device=device, dtype=dtype)
         encoder_hidden_states[:, :257, :] = vlm_proj_out
 

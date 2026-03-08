@@ -269,6 +269,12 @@ def main():
                         if param.requires_grad and param.grad is not None:
                             print(f"[Stage3 grad check] {name} grad mean: {param.grad.abs().mean().item():.6f}")
                             break
+                n = max(1, int(count_acc))
+                rf_avg = rf_acc / n
+                id_avg = id_acc / n
+                total_avg = total_acc / n
+                lam_avg = lam_acc / n
+                gamma_avg = gamma_acc / n
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 if grad_norm.item() > 10000.0:
                     with open(spike_log_path, "a", newline="") as f:
@@ -286,12 +292,6 @@ def main():
                 step_in_accum = 0
                 global_step += 1
 
-                n = max(1, int(count_acc))
-                rf_avg = rf_acc / n
-                id_avg = id_acc / n
-                total_avg = total_acc / n
-                lam_avg = lam_acc / n
-                gamma_avg = gamma_acc / n
                 with open(csv_path, "a", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow([
