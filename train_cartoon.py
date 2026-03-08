@@ -90,6 +90,7 @@ def parse_args():
     parser.add_argument("--use_autocast", action="store_true")
     parser.add_argument("--sanity_check", action="store_true", help="训练前跑一次环境/模型自检；未通过则退出。默认关闭。")
     parser.add_argument("--train_projection", action="store_true", help="若指定则同时训练 vlm_proj/pooled_proj；默认仅训 LoRA 更稳。")
+    parser.add_argument("--no_pbar", action="store_true", help="关闭 tqdm 进度条，减少 I/O 阻塞（后台/长时间跑时建议加）。")
     return parser.parse_args()
 
 
@@ -107,7 +108,7 @@ def main():
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "epoch", "rf_loss", "id_loss", "total_loss", "lam", "gamma", "lr", "grad_norm"])
+            writer.writerow(["step", "epoch", "rf_loss", "id_loss", "total_loss", "lam", "gamma", "lr", "grad_norm", "v_pred_absmax", "target_v_absmax", "lora_diff_mean", "lora_grad_mean"])
 
     spike_log_path = os.path.join(args.checkpoint_root, "spike_log.csv")
     if not os.path.exists(spike_log_path):
@@ -197,6 +198,15 @@ def main():
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 global_step = ckpt.get("global_step", 0)
 
+    # 保存当前 LoRA 状态作为“初始”参考（resume 时则为“本次运行起点”），用于 diff 诊断
+    init_lora_state = {}
+    for name, p in model.named_parameters():
+        if p.requires_grad and "lora" in name.lower():
+            init_lora_state[name] = p.detach().float().cpu().clone()
+    probe_lora_name = next(iter(init_lora_state), None) if init_lora_state else None
+    if probe_lora_name is not None:
+        print(f"[LoRA debug] Saved init state for {len(init_lora_state)} LoRA params; probe param: {probe_lora_name}")
+
     accum_steps = max(1, args.gradient_accumulation_steps)
     print(f"Training on {device}, autocast={args.use_autocast}, gradient_accumulation_steps={accum_steps} (effective batch = {args.batch_size * accum_steps})")
     last_rf, last_id, last_lam, last_total = "0.0000", "0.0000", "0.0000", "0.0000"
@@ -204,7 +214,7 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         step_in_accum = 0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}", mininterval=10.0, disable=args.no_pbar)
         for batch in pbar:
             if step_in_accum == 0:
                 optimizer.zero_grad(set_to_none=True)
@@ -228,14 +238,13 @@ def main():
                         return_aux=True,
                     )
                 else:
-                    rf_loss, preview = model(
+                    rf_loss, preview, aux = model(
                         target_image=target_image,
                         cond_image=cond_image,
                         gamma=gamma,
                         mix_cartoon_latent=args.mix_cartoon_latent,
-                        return_aux=False,
+                        return_aux=True,
                     )
-                    aux = None
 
                 if rf_loss is None or preview is None or (not torch.isfinite(rf_loss)):
                     spike_info = getattr(model, "_last_spike_info", None)
@@ -243,6 +252,10 @@ def main():
                         _write_spike_row(spike_info, global_step, step_in_accum, "")
                         model._last_spike_info = None
                     continue
+
+                # 用于 CSV 与每 50 step 打印：输出侧诊断（v_pred 是否在接近 target）
+                last_v_pred_absmax = aux.get("v_pred_absmax")
+                last_target_v_absmax = aux.get("target_v_absmax")
 
                 total_loss = rf_loss
                 id_loss = torch.zeros((), device=device)
@@ -296,9 +309,33 @@ def main():
                             round(grad_norm.item(), 6),
                             "", "", "",
                         ])
+
+                # LoRA 诊断：在 optimizer.step() 之前读取 grad，保证是“本步更新前”的梯度
+                lora_diff_mean = ""
+                lora_grad_mean = ""
+                if probe_lora_name is not None:
+                    p = dict(model.named_parameters())[probe_lora_name]
+                    cur = p.detach().float().cpu()
+                    init = init_lora_state[probe_lora_name]
+                    lora_diff_mean = (cur - init).abs().mean().item()
+                    lora_grad_mean = p.grad.detach().float().abs().mean().item() if p.grad is not None else 0.0
+
                 optimizer.step()
                 step_in_accum = 0
                 global_step += 1
+
+                if global_step % 50 == 0:
+                    vp = (last_v_pred_absmax if last_v_pred_absmax is not None else 0)
+                    tv = (last_target_v_absmax if last_target_v_absmax is not None else 0)
+                    if probe_lora_name is not None:
+                        print(f"[debug] step={global_step} v_pred_absmax={vp:.4f} target_v_absmax={tv:.4f} | [LoRA] {probe_lora_name} diff_mean={lora_diff_mean:.6e} grad_mean={lora_grad_mean:.6e}")
+                    else:
+                        print(f"[debug] step={global_step} v_pred_absmax={vp:.4f} target_v_absmax={tv:.4f}")
+
+                v_pred_str = round(last_v_pred_absmax, 6) if last_v_pred_absmax is not None else ""
+                target_str = round(last_target_v_absmax, 6) if last_target_v_absmax is not None else ""
+                lora_diff_str = round(lora_diff_mean, 8) if isinstance(lora_diff_mean, (int, float)) else lora_diff_mean
+                lora_grad_str = round(lora_grad_mean, 8) if isinstance(lora_grad_mean, (int, float)) else lora_grad_mean
 
                 with open(csv_path, "a", newline="") as f:
                     writer = csv.writer(f)
@@ -312,6 +349,10 @@ def main():
                         round(gamma_avg, 6),
                         optimizer.param_groups[0]["lr"],
                         round(grad_norm.item(), 6),
+                        v_pred_str,
+                        target_str,
+                        lora_diff_str,
+                        lora_grad_str,
                     ])
 
                 # 1) Training preview（单步、偏暗，仅作 debug）
@@ -386,6 +427,10 @@ def main():
                     round(gamma_avg, 6),
                     optimizer.param_groups[0]["lr"],
                     round(grad_norm.item(), 6),
+                    "",
+                    "",
+                    "",
+                    "",
                 ])
 
     # 训练结束保存最终 checkpoint，避免最后一轮未对齐 save_interval 而漏存

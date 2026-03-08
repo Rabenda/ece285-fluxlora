@@ -376,5 +376,7 @@ class FluxI2ITrainable(nn.Module):
         aux = {
             "sampled_t": t.detach(),
             "packed_latents": packed_latents.detach(),
+            "v_pred_absmax": v_pred_f.abs().max().detach().item(),
+            "target_v_absmax": target_v.abs().max().detach().item(),
         }
         return loss, out_image, aux
