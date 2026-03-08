@@ -223,7 +223,8 @@ class FluxI2ITrainable(nn.Module):
         pooled_projections = self.pooled_proj(vlm_pooled)  # [B,768]
         pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
         pooled_projections = pooled_projections * 0.01
-        guidance = torch.full((bsz,), float(guidance_scale), device=device, dtype=dtype)
+        # guidance = torch.full((bsz,), float(guidance_scale), device=device, dtype=dtype)
+        guidance = torch.full((bsz,), 0.0, device=device, dtype=dtype)
 
         # --------- 2) VAE encode & target_latents ----------
         with torch.no_grad():
@@ -282,7 +283,7 @@ class FluxI2ITrainable(nn.Module):
             hidden_states=x_t,
             encoder_hidden_states=encoder_hidden_states,
             pooled_projections=pooled_projections,
-            timestep=t * 1000.0,
+            timestep=t,
             img_ids=img_ids,
             txt_ids=txt_ids,
             return_dict=False,
@@ -354,7 +355,7 @@ class FluxI2ITrainable(nn.Module):
                 hidden_states=x_tp,
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_projections,
-                timestep=t_p * 1000.0,
+                timestep=t_p,
                 img_ids=img_ids,
                 txt_ids=txt_ids,
                 return_dict=False,
