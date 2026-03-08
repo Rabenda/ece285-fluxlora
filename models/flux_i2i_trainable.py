@@ -190,7 +190,7 @@ class FluxI2ITrainable(nn.Module):
         cond_image=None,   # real photo / identity source
         gamma=3.0,
         proto_momentum=0.99,
-        mix_cartoon_latent=0.35,
+        mix_cartoon_latent=0.6,
         flat_strength=0.35,
         guidance_scale=1.0,
         preview_t=0.2,
