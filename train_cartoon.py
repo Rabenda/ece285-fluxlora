@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="每 N 個 micro-batch 累積梯度後更新一次，等效 batch_size = batch_size * N。")
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=1e-5, help="学习率；新实验 A 建议 1e-5。")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -80,9 +80,10 @@ def parse_args():
     parser.add_argument("--sample_steps", type=int, default=20, help="infer sample 的 ODE 步数。")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--gamma_start", type=float, default=2.0)
-    parser.add_argument("--gamma_end", type=float, default=2.0)
-    parser.add_argument("--gamma_warmup_steps", type=int, default=0)
+    parser.add_argument("--gamma_start", type=float, default=0.0, help="gamma 调度起点；新实验 A 建议 0.0。")
+    parser.add_argument("--gamma_end", type=float, default=0.3, help="gamma 调度终点；新实验 A 建议 0.3。")
+    parser.add_argument("--gamma_warmup_steps", type=int, default=300, help="gamma warmup 步数。")
+    parser.add_argument("--mix_cartoon_latent", type=float, default=0.6, help="target_latents 中 cartoon 混合比例，z_mix = (1-m)*z_real + m*z_cartoon。新实验 A 建议 0.6。")
     parser.add_argument("--stage", type=str, default="stage3", choices=["stage2", "stage3"], help="stage2: LoRA only; stage3: LoRA + identity loss.")
     parser.add_argument("--lambda0", type=float, default=0.6, help="Identity loss base weight in stage3.")
     parser.add_argument("--lambda_p", type=float, default=2.0, help="Time-dependent exponent in stage3.")
@@ -218,6 +219,7 @@ def main():
                         target_image=target_image,
                         cond_image=cond_image,
                         gamma=gamma,
+                        mix_cartoon_latent=args.mix_cartoon_latent,
                         return_aux=True,
                     )
                 else:
@@ -225,6 +227,7 @@ def main():
                         target_image=target_image,
                         cond_image=cond_image,
                         gamma=gamma,
+                        mix_cartoon_latent=args.mix_cartoon_latent,
                         return_aux=False,
                     )
                     aux = None
@@ -310,7 +313,7 @@ def main():
                 if global_step % args.preview_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
-                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma)
+                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
                         if preview is not None:
                             save_preview_images(preview, os.path.join(args.samples_dir, f"preview_step_{global_step:06d}.png"))
                     model.train()
@@ -319,7 +322,7 @@ def main():
                 if global_step > 0 and global_step % args.infer_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=args.use_autocast):
-                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma)
+                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
                     infer_img = run_inference_one(model, device, fixed_real, args.sample_t0, args.sample_steps, 1.0)
                     if preview is not None:
                         real_01 = (fixed_real[0].float().cpu() + 1.0) / 2.0

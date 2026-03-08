@@ -52,8 +52,10 @@ def parse_args():
     p.add_argument("--input_dir", type=str, default=None, help="批量：原图目录。与 --output_dir 同时指定时启用批量。")
     p.add_argument("--output_dir", type=str, default=None, help="批量：结果目录，将创建 real/ 与 gen/ 子目录并自动整理。")
     p.add_argument("--organize", action="store_true", help="单张模式：在 output 所在目录下创建 real/ 与 gen/ 并整理，便于评估。")
-    p.add_argument("--t0", type=float, default=0.5, help="Start timestep for ODE.")
-    p.add_argument("--steps", type=int, default=15, help="ODE refinement steps.")
+    p.add_argument("--t0", type=float, default=0.5, help="Start timestep for ODE（多步时有效）。")
+    p.add_argument("--steps", type=int, default=15, help="ODE refinement steps（多步时有效）。")
+    p.add_argument("--single_step", action="store_true", help="实验 A：用训练 preview 同款单步 x0 公式推理，不跑多步 Euler。")
+    p.add_argument("--single_step_t", type=float, default=0.2, help="单步模式下的 t（与训练 preview_t 一致）。")
     p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it (older diffusers/FLUX). For diffusers>=0.30 + FLUX.1-schnell, 此值會被自動忽略。")
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
@@ -64,34 +66,43 @@ def parse_args():
     return p.parse_args()
 
 
-def _run_one(model, device, img_tensor, t0, steps, guidance):
+def _run_one(model, device, img_tensor, t0, steps, guidance, single_step=False, single_step_t=0.2):
     """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (C,H,W) 在 [0,1]。"""
     steps = max(1, int(steps))
+    t_use = float(single_step_t) if single_step else t0
     with torch.no_grad():
         latents = model.vae.encode(img_tensor.to(torch.float32)).latent_dist.mode()
         latents = (latents - model.vae.config.shift_factor) * model.scaling_factor
         h, w = latents.shape[-2], latents.shape[-1]
         x_start = model._pack(latents).to(torch.bfloat16)
         noise = torch.randn_like(x_start)
-        x_t = (1.0 - t0) * x_start + t0 * noise
+        x_t = (1.0 - t_use) * x_start + t_use * noise
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(device == "cuda")):
-            vlm_feats = model.get_vlm_embedding(img_tensor)
-            pooled = model.clip_vision(
-                ((F.interpolate((img_tensor + 1.0) / 2.0, size=(224, 224), mode="bilinear", align_corners=False)
-                  - model.clip_mean.to(img_tensor.device)) / model.clip_std.to(img_tensor.device)).to(torch.bfloat16)
-            ).pooler_output
-            pooled_projections = model.pooled_proj(pooled).to(torch.bfloat16)
+            # 和训练时完全一致的 CLIP 预处理与 conditioning 路径
+            clip_in = F.interpolate((img_tensor + 1.0) / 2.0, size=(224, 224), mode="bilinear", align_corners=False)
+            clip_in = (clip_in - model.clip_mean.to(img_tensor.device)) / model.clip_std.to(img_tensor.device)
+            clip_outputs = model.clip_vision(clip_in.to(torch.bfloat16))
+
+            vlm_feats_raw = clip_outputs.last_hidden_state
+            vlm_proj_out = model.vlm_proj(vlm_feats_raw)
+            vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
+            vlm_proj_out = vlm_proj_out * 0.01
+
+            pooled_raw = clip_outputs.pooler_output
+            pooled_projections = model.pooled_proj(pooled_raw)
+            pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
+            pooled_projections = pooled_projections * 0.01
+
         encoder_hidden_states = torch.zeros((1, 512, 4096), device=device, dtype=torch.bfloat16)
-        encoder_hidden_states[:, :257, :] = vlm_feats
+        encoder_hidden_states[:, :257, :] = vlm_proj_out.to(torch.bfloat16)
         img_ids, txt_ids = model._get_ids(h, w, device)
         guidance_t = torch.full((1,), float(guidance), device=device, dtype=torch.bfloat16)
 
     with torch.no_grad():
-        dt = t0 / steps
-        for i in range(steps):
-            current_t = t0 * (1 - i / steps)
-            t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
+        if single_step:
+            # 实验 A：单步 x0 = x_t - t * v_pred（与训练 preview 同款）
+            t_tensor = torch.full((1,), t_use, device=device, dtype=torch.bfloat16)
             unet_kw = dict(
                 hidden_states=x_t,
                 encoder_hidden_states=encoder_hidden_states,
@@ -101,12 +112,30 @@ def _run_one(model, device, img_tensor, t0, steps, guidance):
                 txt_ids=txt_ids,
                 return_dict=False,
             )
-            accepts_guidance = getattr(model, "_accepts_guidance", False)
-            if accepts_guidance:
+            if getattr(model, "_accepts_guidance", False):
                 unet_kw["guidance"] = guidance_t
             v_pred = model.unet(**unet_kw)[0]
             v_pred = torch.nan_to_num(v_pred, nan=0.0).clamp(-3.0, 3.0)
-            x_t = x_t - v_pred * dt
+            x_t = x_t - t_tensor.view(-1, 1, 1) * v_pred
+        else:
+            dt = t0 / steps
+            for i in range(steps):
+                current_t = t0 * (1 - i / steps)
+                t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
+                unet_kw = dict(
+                    hidden_states=x_t,
+                    encoder_hidden_states=encoder_hidden_states,
+                    pooled_projections=pooled_projections,
+                    timestep=t_tensor * 1000,
+                    img_ids=img_ids,
+                    txt_ids=txt_ids,
+                    return_dict=False,
+                )
+                if getattr(model, "_accepts_guidance", False):
+                    unet_kw["guidance"] = guidance_t
+                v_pred = model.unet(**unet_kw)[0]
+                v_pred = torch.nan_to_num(v_pred, nan=0.0).clamp(-3.0, 3.0)
+                x_t = x_t - v_pred * dt
 
     with torch.no_grad():
         out_latents = model._unpack(x_t, h, w).to(torch.float32)
@@ -178,7 +207,7 @@ def main():
             stem = Path(name).stem
             ext = Path(name).suffix.lower()
             img_tensor = transform(Image.open(inp_path).convert("RGB")).unsqueeze(0).to(device)
-            out_img = _run_one(model, device, img_tensor, args.t0, args.steps, args.guidance)
+            out_img = _run_one(model, device, img_tensor, args.t0, args.steps, args.guidance, args.single_step, args.single_step_t)
             gen_path = os.path.join(gen_dir, stem + ".png")
             vutils.save_image(out_img.unsqueeze(0), gen_path)
             shutil.copy2(inp_path, os.path.join(real_dir, stem + ext))
@@ -197,7 +226,7 @@ def main():
     # 单张模式
     img_tensor = transform(Image.open(args.input).convert("RGB")).unsqueeze(0).to(device)
     print("Refining trajectory...")
-    out_img = _run_one(model, device, img_tensor, args.t0, args.steps, args.guidance)
+    out_img = _run_one(model, device, img_tensor, args.t0, args.steps, args.guidance, args.single_step, args.single_step_t)
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
