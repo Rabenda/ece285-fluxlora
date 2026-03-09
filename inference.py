@@ -89,11 +89,11 @@ def _run_one(model, device, img_tensor, t_stop, steps, guidance, single_step=Fal
             vlm_feats_raw = clip_outputs.last_hidden_state
             vlm_proj_out = model.vlm_proj(vlm_feats_raw)
             vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
-            vlm_proj_out = vlm_proj_out * 0.01
+            vlm_proj_out = vlm_proj_out * 0.1
             pooled_raw = clip_outputs.pooler_output
             pooled_projections = model.pooled_proj(pooled_raw)
             pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
-            pooled_projections = pooled_projections * 0.01
+            pooled_projections = pooled_projections * 0.05
 
         encoder_hidden_states = torch.zeros((1, 512, 4096), device=device, dtype=torch.bfloat16)
         encoder_hidden_states[:, :257, :] = vlm_proj_out.to(torch.bfloat16)

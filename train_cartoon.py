@@ -111,7 +111,7 @@ def main():
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "epoch", "rf_loss", "id_loss", "total_loss", "lam", "gamma", "lr", "grad_norm", "v_pred_absmax", "target_v_absmax", "lora_diff_mean", "lora_grad_mean"])
+            writer.writerow(["step", "epoch", "rf_loss", "id_loss", "total_loss", "lam", "gamma", "lr", "grad_norm", "v_pred_absmax", "target_v_absmax", "v_src_absmax", "lora_diff_mean", "lora_grad_mean"])
 
     spike_log_path = os.path.join(args.checkpoint_root, "spike_log.csv")
     if not os.path.exists(spike_log_path):
@@ -260,9 +260,10 @@ def main():
                         model._last_spike_info = None
                     continue
 
-                # 用于 CSV 与每 50 step 打印：输出侧诊断（v_pred 是否在接近 target）
+                # 用于 CSV 与每 50 step 打印：输出侧诊断（interpolation + source-end 两支）
                 last_v_pred_absmax = aux.get("v_pred_absmax")
                 last_target_v_absmax = aux.get("target_v_absmax")
+                last_v_src_absmax = aux.get("v_src_absmax")
 
                 total_loss = rf_loss
                 id_loss = torch.zeros((), device=device)
@@ -335,13 +336,15 @@ def main():
                 if global_step % 50 == 0:
                     vp = (last_v_pred_absmax if last_v_pred_absmax is not None else 0)
                     tv = (last_target_v_absmax if last_target_v_absmax is not None else 0)
+                    vs = (last_v_src_absmax if last_v_src_absmax is not None else 0)
                     if probe_lora_name is not None:
-                        print(f"[debug] step={global_step} v_pred_absmax={vp:.4f} target_v_absmax={tv:.4f} | [LoRA] {probe_lora_name} diff_mean={lora_diff_mean:.6e} grad_mean={lora_grad_mean:.6e}")
+                        print(f"[debug] step={global_step} v_pred_absmax={vp:.4f} v_src_absmax={vs:.4f} target_v_absmax={tv:.4f} | [LoRA] {probe_lora_name} diff_mean={lora_diff_mean:.6e} grad_mean={lora_grad_mean:.6e}")
                     else:
-                        print(f"[debug] step={global_step} v_pred_absmax={vp:.4f} target_v_absmax={tv:.4f}")
+                        print(f"[debug] step={global_step} v_pred_absmax={vp:.4f} v_src_absmax={vs:.4f} target_v_absmax={tv:.4f}")
 
                 v_pred_str = round(last_v_pred_absmax, 6) if last_v_pred_absmax is not None else ""
                 target_str = round(last_target_v_absmax, 6) if last_target_v_absmax is not None else ""
+                v_src_str = round(last_v_src_absmax, 6) if last_v_src_absmax is not None else ""
                 lora_diff_str = round(lora_diff_mean, 8) if isinstance(lora_diff_mean, (int, float)) else lora_diff_mean
                 lora_grad_str = round(lora_grad_mean, 8) if isinstance(lora_grad_mean, (int, float)) else lora_grad_mean
 
@@ -359,6 +362,7 @@ def main():
                         round(grad_norm.item(), 6),
                         v_pred_str,
                         target_str,
+                        v_src_str,
                         lora_diff_str,
                         lora_grad_str,
                     ])
@@ -454,6 +458,7 @@ def main():
                     round(gamma_avg, 6),
                     optimizer.param_groups[0]["lr"],
                     round(grad_norm.item(), 6),
+                    "",
                     "",
                     "",
                     "",
