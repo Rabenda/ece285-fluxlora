@@ -195,8 +195,10 @@ class FluxI2ITrainable(nn.Module):
         flat_strength=0.35,
         guidance_scale=1.0,
         preview_t=0.2,
+        source_preview_step=0.15,
         force_t=None,
         return_aux=False,
+        noise_factor=0.02,
     ):
         device = target_image.device
         dtype = torch.bfloat16
@@ -256,12 +258,22 @@ class FluxI2ITrainable(nn.Module):
 
             target_latents = (z_flat + gamma_eff * bias_up).clamp(-5.0, 5.0).to(dtype)  # [B,16,H,W]
 
-        # --------- 3) Flow training in TOKEN space (correct tokenization) ----------
+        # --------- 3) Flow training in TOKEN space (I2I Rectified Flow) ----------
+        # Parameterization:
+        #   x(t) = (1 - t) * target + t * source
+        #   so dx/dt = source - target
+        # Training predicts dx/dt.
+        # In inference, we integrate backward in t (from 1 -> t_stop),
+        # hence update uses x <- x - v * dt.
         h, w = target_latents.shape[-2], target_latents.shape[-1]
-        packed_latents = self._pack(target_latents)              # [B,N,64]
-        noise = torch.randn_like(packed_latents)                 # [B,N,64]
+        packed_target = self._pack(target_latents)   # 终点 (t=0): 卡通域
+        packed_real = self._pack(z_real)             # 起点 (t=1): 真人域
+        noise = torch.randn_like(packed_target)
+        packed_source = packed_real + noise_factor * noise
+
         if force_t is None:
-            t = torch.rand((bsz,), device=device, dtype=dtype)   # [B]
+            u = torch.rand((bsz,), device=device, dtype=dtype)
+            t = torch.sqrt(u)  # 偏向 source 端
         else:
             if not torch.is_tensor(force_t):
                 force_t = torch.tensor(float(force_t), device=device, dtype=dtype)
@@ -270,13 +282,11 @@ class FluxI2ITrainable(nn.Module):
                 t = t.repeat(bsz)
             elif t.numel() != bsz:
                 raise ValueError(f"force_t length must be 1 or batch size ({bsz}), got {t.numel()}")
-        x_t = (1.0 - t.view(-1, 1, 1)) * packed_latents + t.view(-1, 1, 1) * noise
 
-        # dtype safety (avoid rms_norm mismatch)
+        x_t = (1.0 - t.view(-1, 1, 1)) * packed_target + t.view(-1, 1, 1) * packed_source
         x_t = x_t.to(dtype)
         encoder_hidden_states = encoder_hidden_states.to(dtype)
         pooled_projections = pooled_projections.to(dtype)
-
         img_ids, txt_ids = self._get_ids(h, w, device)
 
         unet_kw = dict(
@@ -293,14 +303,14 @@ class FluxI2ITrainable(nn.Module):
         v_pred = self.unet(**unet_kw)[0]
 
         v_pred_f = v_pred.float()
-        target_v = (noise - packed_latents).float()
+        target_v = (packed_source - packed_target).float()
         loss = F.mse_loss(v_pred_f, target_v)
 
         def _print_diagnostics(tag):
             print(f"[{tag}]")
             print("  t mean:", t.float().mean().item())
             print("  gamma:", float(gamma), "gamma_eff:", float(gamma_eff))
-            print("  packed_latents absmax:", packed_latents.float().abs().max().item())
+            print("  packed_target absmax:", packed_target.float().abs().max().item())
             print("  x_t absmax:", x_t.float().abs().max().item())
             print("  v_pred absmax:", v_pred_f.abs().max().item(), "mean abs:", v_pred_f.abs().mean().item())
             print("  target_v absmax:", target_v.abs().max().item(), "mean abs:", target_v.abs().mean().item())
@@ -341,14 +351,14 @@ class FluxI2ITrainable(nn.Module):
             self._last_spike_info = None
 
         # --------- 4) Preview ----------
-        # Stage3 需要 preview 带梯度，使 L_ID 能回传到 LoRA；其余情况用 no_grad 省显存
+        # interpolation preview：从 t=preview_t 的插值点出发
         need_preview_grad = self.training and return_aux
         preview_ctx = nullcontext() if need_preview_grad else torch.no_grad()
         with preview_ctx:
             t_p = torch.full((bsz,), float(preview_t), device=device, dtype=dtype)
-            noise_p = torch.randn_like(packed_latents)
-            x_tp = (1.0 - t_p.view(-1, 1, 1)) * packed_latents + t_p.view(-1, 1, 1) * noise_p
-
+            noise_p = torch.randn_like(packed_target)
+            packed_source_p = packed_real + noise_factor * noise_p
+            x_tp = (1.0 - t_p.view(-1, 1, 1)) * packed_target + t_p.view(-1, 1, 1) * packed_source_p
             x_tp = x_tp.to(dtype)
 
             unet_kw_p = dict(
@@ -373,10 +383,34 @@ class FluxI2ITrainable(nn.Module):
         if not return_aux:
             return loss, out_image
 
+        # source-end preview：真正贴近推理的 probe，t=1 状态（仅 return_aux 时计算）
+        with torch.no_grad():
+            t_src = torch.ones((bsz,), device=device, dtype=dtype)
+            noise_src = torch.randn_like(packed_real)
+            packed_source_src = packed_real + noise_factor * noise_src
+            unet_kw_src = dict(
+                hidden_states=packed_source_src.to(dtype),
+                encoder_hidden_states=encoder_hidden_states,
+                pooled_projections=pooled_projections,
+                timestep=t_src,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                return_dict=False,
+            )
+            if self._accepts_guidance:
+                unet_kw_src["guidance"] = guidance
+            v_src = self.unet(**unet_kw_src)[0]
+            v_src = torch.nan_to_num(v_src, nan=0.0)
+            x_src = packed_source_src - source_preview_step * v_src
+            out_latents_src = self._unpack(x_src, h, w).float().clamp(-5.0, 5.0)
+            out_latents_src = (out_latents_src / self.scaling_factor) + self.vae.config.shift_factor
+            out_image_src = self.vae.decode(out_latents_src).sample
+
         aux = {
             "sampled_t": t.detach(),
-            "packed_latents": packed_latents.detach(),
+            "packed_latents": packed_target.detach(),
             "v_pred_absmax": v_pred_f.abs().max().detach().item(),
             "target_v_absmax": target_v.abs().max().detach().item(),
+            "source_preview": out_image_src.detach(),
         }
         return loss, out_image, aux

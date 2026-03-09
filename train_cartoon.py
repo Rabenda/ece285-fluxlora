@@ -74,10 +74,13 @@ def parse_args():
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--save_interval_step", type=int, default=50)
-    parser.add_argument("--preview_interval_step", type=int, default=50, help="每 N 步存一次 training preview（preview_step_*.png）。")
-    parser.add_argument("--infer_interval_step", type=int, default=50, help="每 N 步用真实多步推理存一次 infer_step_*.png 与 compare_step_*.png。")
-    parser.add_argument("--sample_t0", type=float, default=0.5, help="infer sample 的 ODE 起始 t0。")
-    parser.add_argument("--sample_steps", type=int, default=20, help="infer sample 的 ODE 步数。")
+    parser.add_argument("--preview_interval_step", type=int, default=50, help="每 N 步存 interp_preview 与 source_preview。")
+    parser.add_argument("--infer_interval_step", type=int, default=50, help="每 N 步存 compare（含 single/multi-step infer）与 infer_step_*.png。")
+    parser.add_argument("--sample_t_stop", type=float, default=0.0, help="multi-step infer 从 t=1 积分到 t_stop；越小越卡通。")
+    parser.add_argument("--sample_steps", type=int, default=20, help="multi-step infer 的 ODE 步数。")
+    parser.add_argument("--sample_single_step_t", type=float, default=0.15, help="single-step probe 的步长，与 source_preview 语义一致。")
+    parser.add_argument("--source_preview_step", type=float, default=0.15, help="source-end preview 步长，独立于 interpolation preview_t。")
+    parser.add_argument("--noise_factor", type=float, default=0.02, help="起点 latent 噪声比例，与训练一致。")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--gamma_start", type=float, default=0.0, help="gamma 调度起点；新实验 A 建议 0.0。")
@@ -236,6 +239,8 @@ def main():
                         gamma=gamma,
                         mix_cartoon_latent=args.mix_cartoon_latent,
                         return_aux=True,
+                        noise_factor=args.noise_factor,
+                        source_preview_step=args.source_preview_step,
                     )
                 else:
                     rf_loss, preview, aux = model(
@@ -244,6 +249,8 @@ def main():
                         gamma=gamma,
                         mix_cartoon_latent=args.mix_cartoon_latent,
                         return_aux=True,
+                        noise_factor=args.noise_factor,
+                        source_preview_step=args.source_preview_step,
                     )
 
                 if rf_loss is None or preview is None or (not torch.isfinite(rf_loss)):
@@ -264,7 +271,8 @@ def main():
                     sampled_t = float(aux["sampled_t"].mean().detach().item())
                     lam = lambda_schedule(sampled_t, args.lambda0, args.lambda_p)
                     with torch.amp.autocast("cuda", enabled=False):
-                        id_loss = id_criterion(real_imgs.float(), preview.float())
+                        # 关键：ID Loss 必须算在 source_preview 上，强迫模型在真实推理起点保持五官
+                        id_loss = id_criterion(real_imgs.float(), aux["source_preview"].float())
                     total_loss = rf_loss + lam * id_loss
 
             if not torch.isfinite(total_loss):
@@ -355,28 +363,47 @@ def main():
                         lora_grad_str,
                     ])
 
-                # 1) Training preview（单步、偏暗，仅作 debug）
+                # 1) Training preview：interp_preview 与 source_preview 分开存，文件名明确
                 if global_step % args.preview_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
-                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
+                        _, preview, aux = model(
+                            target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma,
+                            mix_cartoon_latent=args.mix_cartoon_latent, return_aux=True,
+                            noise_factor=args.noise_factor, source_preview_step=args.source_preview_step,
+                        )
                         if preview is not None:
-                            save_preview_images(preview, os.path.join(args.samples_dir, f"preview_step_{global_step:06d}.png"))
+                            save_preview_images(preview, os.path.join(args.samples_dir, f"interp_preview_step_{global_step:06d}.png"))
+                        if "source_preview" in aux:
+                            save_preview_images(aux["source_preview"], os.path.join(args.samples_dir, f"source_preview_step_{global_step:06d}.png"))
                     model.train()
 
-                # 2) 真实多步推理 sample + 对比图（real | preview | infer）
+                # 2) 真实推理 + 对比图（real | interp_preview | source_preview | infer_single | infer_multi）
                 if global_step > 0 and global_step % args.infer_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
-                        _, preview = model(target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma, mix_cartoon_latent=args.mix_cartoon_latent)
-                        infer_img = run_inference_one(model, device, fixed_real, args.sample_t0, args.sample_steps, 1.0)
-                    if preview is not None:
-                        real_01 = (fixed_real[0].float().cpu() + 1.0) / 2.0
-                        preview_01 = (preview[0].float().cpu().clamp(-1, 1) + 1.0) / 2.0
-                        infer_01 = infer_img  # (C,H,W) already [0,1]
-                        compare = torch.stack([real_01, preview_01, infer_01], dim=0)
-                        vutils.save_image(compare, os.path.join(args.samples_dir, f"compare_step_{global_step:06d}.png"), nrow=3)
-                    vutils.save_image(infer_img.unsqueeze(0), os.path.join(args.samples_dir, f"infer_step_{global_step:06d}.png"))
+                        _, preview, aux = model(
+                            target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma,
+                            mix_cartoon_latent=args.mix_cartoon_latent, return_aux=True,
+                            noise_factor=args.noise_factor, source_preview_step=args.source_preview_step,
+                        )
+                        infer_single = run_inference_one(
+                            model, device, fixed_real[0:1], args.sample_t_stop, args.sample_steps, 1.0,
+                            single_step=True, single_step_t=args.sample_single_step_t, noise_factor=args.noise_factor,
+                        )
+                        infer_multi = run_inference_one(
+                            model, device, fixed_real[0:1], args.sample_t_stop, args.sample_steps, 1.0,
+                            noise_factor=args.noise_factor,
+                        )
+                    real_01 = (fixed_real[0].float().cpu() + 1.0) / 2.0
+                    interp_preview_01 = (preview[0].float().cpu().clamp(-1, 1) + 1.0) / 2.0 if preview is not None else real_01
+                    source_preview_01 = (aux["source_preview"][0].float().cpu().clamp(-1, 1) + 1.0) / 2.0 if "source_preview" in aux else interp_preview_01
+                    infer_single_01 = infer_single  # (C,H,W) already [0,1]
+                    infer_multi_01 = infer_multi
+                    compare = torch.stack([real_01, interp_preview_01, source_preview_01, infer_single_01, infer_multi_01], dim=0)
+                    vutils.save_image(compare, os.path.join(args.samples_dir, f"compare_step_{global_step:06d}.png"), nrow=5)
+                    vutils.save_image(infer_multi.unsqueeze(0), os.path.join(args.samples_dir, f"infer_step_{global_step:06d}.png"))
+                    vutils.save_image(infer_single.unsqueeze(0), os.path.join(args.samples_dir, f"infer_single_step_{global_step:06d}.png"))
                     model.train()
 
                 if global_step > 0 and global_step % args.save_interval_step == 0:

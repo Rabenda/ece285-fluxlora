@@ -52,10 +52,11 @@ def parse_args():
     p.add_argument("--input_dir", type=str, default=None, help="批量：原图目录。与 --output_dir 同时指定时启用批量。")
     p.add_argument("--output_dir", type=str, default=None, help="批量：结果目录，将创建 real/ 与 gen/ 子目录并自动整理。")
     p.add_argument("--organize", action="store_true", help="单张模式：在 output 所在目录下创建 real/ 与 gen/ 并整理，便于评估。")
-    p.add_argument("--t0", type=float, default=0.5, help="Start timestep for ODE（多步时有效）。")
-    p.add_argument("--steps", type=int, default=15, help="ODE refinement steps（多步时有效）。")
-    p.add_argument("--single_step", action="store_true", help="实验 A：用训练 preview 同款单步 x0 公式推理，不跑多步 Euler。")
-    p.add_argument("--single_step_t", type=float, default=0.2, help="单步模式下的 t（与训练 preview_t 一致）。")
+    p.add_argument("--t_stop", type=float, default=0.0, help="多步推理从 t=1 积分到 t_stop。越小越卡通，越大越保守。")
+    p.add_argument("--steps", type=int, default=20, help="ODE 积分步数。")
+    p.add_argument("--single_step", action="store_true", help="source-end 单步 probe，不跑多步。")
+    p.add_argument("--single_step_t", type=float, default=0.15, help="单步 probe 的 step_scale，控制步长。")
+    p.add_argument("--noise_factor", type=float, default=0.02, help="起点 latent 加的噪声比例，与训练一致。")
     p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it (older diffusers/FLUX). For diffusers>=0.30 + FLUX.1-schnell, 此值會被自動忽略。")
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
@@ -66,29 +67,29 @@ def parse_args():
     return p.parse_args()
 
 
-def _run_one(model, device, img_tensor, t0, steps, guidance, single_step=False, single_step_t=0.2):
-    """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (C,H,W) 在 [0,1]。"""
+def _run_one(model, device, img_tensor, t_stop, steps, guidance, single_step=False, single_step_t=0.2, noise_factor=0.02):
+    """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (C,H,W) 在 [0,1]。
+    I2I Rectified Flow：起点 = 真人 latent + 微量噪声 (t=1)，积分到 t=t_stop。
+    控制风格强度靠 t_stop：0=强卡通，0.5=轻风格。
+    """
     steps = max(1, int(steps))
-    t_use = float(single_step_t) if single_step else t0
     with torch.no_grad():
         latents = model.vae.encode(img_tensor.to(torch.float32)).latent_dist.mode()
         latents = (latents - model.vae.config.shift_factor) * model.scaling_factor
         h, w = latents.shape[-2], latents.shape[-1]
-        x_start = model._pack(latents).to(torch.bfloat16)
-        noise = torch.randn_like(x_start)
-        x_t = (1.0 - t_use) * x_start + t_use * noise
+        packed_real = model._pack(latents).to(torch.bfloat16)
+        noise = torch.randn_like(packed_real)
+        packed_source = packed_real + noise_factor * noise
+        x_t = packed_source.clone()
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
-            # 和训练时完全一致的 CLIP 预处理与 conditioning 路径
             clip_in = F.interpolate((img_tensor + 1.0) / 2.0, size=(224, 224), mode="bilinear", align_corners=False)
             clip_in = (clip_in - model.clip_mean.to(img_tensor.device)) / model.clip_std.to(img_tensor.device)
             clip_outputs = model.clip_vision(clip_in.to(torch.bfloat16))
-
             vlm_feats_raw = clip_outputs.last_hidden_state
             vlm_proj_out = model.vlm_proj(vlm_feats_raw)
             vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
             vlm_proj_out = vlm_proj_out * 0.01
-
             pooled_raw = clip_outputs.pooler_output
             pooled_projections = model.pooled_proj(pooled_raw)
             pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
@@ -97,47 +98,46 @@ def _run_one(model, device, img_tensor, t0, steps, guidance, single_step=False, 
         encoder_hidden_states = torch.zeros((1, 512, 4096), device=device, dtype=torch.bfloat16)
         encoder_hidden_states[:, :257, :] = vlm_proj_out.to(torch.bfloat16)
         img_ids, txt_ids = model._get_ids(h, w, device)
-        # FLUX.1-schnell 蒸馏模型：推理时 guidance 固定 0.0，否则出图会崩
         guidance_t = torch.full((1,), 0.0, device=device, dtype=torch.bfloat16)
 
     with torch.no_grad():
         if single_step:
-            # 实验 A：单步 x0 = x_t - t * v_pred（与训练 preview 同款）
-            t_tensor = torch.full((1,), t_use, device=device, dtype=torch.bfloat16)
-            # diffusers FLUX 内部已做时间步缩放，不再 * 1000
-            timestep = t_tensor.to(torch.bfloat16)
+            # source-end probe：状态是 source，时间标签必须是 1.0
+            t_tensor = torch.full((1,), 1.0, device=device, dtype=torch.bfloat16)
             unet_kw = dict(
                 hidden_states=x_t.to(torch.bfloat16),
                 encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
                 pooled_projections=pooled_projections.to(torch.bfloat16),
-                timestep=timestep,
+                timestep=t_tensor,
                 img_ids=img_ids.to(torch.bfloat16),
                 txt_ids=txt_ids.to(torch.bfloat16),
                 return_dict=False,
             )
             if getattr(model, "_accepts_guidance", False):
-                unet_kw["guidance"] = guidance_t.to(torch.bfloat16)
+                unet_kw["guidance"] = guidance_t
             v_pred = model.unet(**unet_kw)[0]
             v_pred = torch.nan_to_num(v_pred, nan=0.0)
-            x_t = x_t - t_tensor.view(-1, 1, 1) * v_pred
+            step_scale = max(1e-4, min(1.0, float(single_step_t)))
+            x_t = x_t - step_scale * v_pred
         else:
-            dt = t0 / steps
+            # 从 t=1.0 走到 t=t_stop，控制风格强度靠提前停下
+            t_stop = max(0.0, min(1.0, float(t_stop)))
+            total_span = 1.0 - t_stop
+            dt = total_span / steps
             for i in range(steps):
-                current_t = t0 * (1 - i / steps)
+                current_t = 1.0 - i * dt
                 t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
-                # diffusers FLUX 内部已做时间步缩放，不再 * 1000
-                timestep = t_tensor.to(torch.bfloat16)
                 unet_kw = dict(
                     hidden_states=x_t.to(torch.bfloat16),
                     encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
                     pooled_projections=pooled_projections.to(torch.bfloat16),
-                    timestep=timestep,
+                    timestep=t_tensor,
                     img_ids=img_ids.to(torch.bfloat16),
                     txt_ids=txt_ids.to(torch.bfloat16),
                     return_dict=False,
                 )
                 if getattr(model, "_accepts_guidance", False):
-                    unet_kw["guidance"] = guidance_t.to(torch.bfloat16)
+                    unet_kw["guidance"] = guidance_t
                 v_pred = model.unet(**unet_kw)[0]
                 v_pred = torch.nan_to_num(v_pred, nan=0.0)
                 x_t = x_t - v_pred * dt
@@ -212,7 +212,7 @@ def main():
             stem = Path(name).stem
             ext = Path(name).suffix.lower()
             img_tensor = transform(Image.open(inp_path).convert("RGB")).unsqueeze(0).to(device)
-            out_img = _run_one(model, device, img_tensor, args.t0, args.steps, args.guidance, args.single_step, args.single_step_t)
+            out_img = _run_one(model, device, img_tensor, args.t_stop, args.steps, args.guidance, args.single_step, args.single_step_t, noise_factor=args.noise_factor)
             gen_path = os.path.join(gen_dir, stem + ".png")
             vutils.save_image(out_img.unsqueeze(0), gen_path)
             shutil.copy2(inp_path, os.path.join(real_dir, stem + ext))
@@ -231,7 +231,7 @@ def main():
     # 单张模式
     img_tensor = transform(Image.open(args.input).convert("RGB")).unsqueeze(0).to(device)
     print("Refining trajectory...")
-    out_img = _run_one(model, device, img_tensor, args.t0, args.steps, args.guidance, args.single_step, args.single_step_t)
+    out_img = _run_one(model, device, img_tensor, args.t_stop, args.steps, args.guidance, args.single_step, args.single_step_t, noise_factor=args.noise_factor)
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
