@@ -218,13 +218,13 @@ class FluxI2ITrainable(nn.Module):
         # Condition injection（拆出 vlm_proj_out 便于 spike 时打印幅值）
         vlm_proj_out = self.vlm_proj(vlm_feats)
         vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
-        vlm_proj_out = vlm_proj_out * 0.01
+        vlm_proj_out = vlm_proj_out * 0.05
         encoder_hidden_states = torch.zeros((bsz, 512, 4096), device=device, dtype=dtype)
         encoder_hidden_states[:, :257, :] = vlm_proj_out
 
         pooled_projections = self.pooled_proj(vlm_pooled)  # [B,768]
         pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
-        pooled_projections = pooled_projections * 0.01
+        pooled_projections = pooled_projections * 0.02
         # guidance = torch.full((bsz,), float(guidance_scale), device=device, dtype=dtype)
         guidance = torch.full((bsz,), 0.0, device=device, dtype=dtype)
 
