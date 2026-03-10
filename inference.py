@@ -283,21 +283,24 @@ def main():
     img_tensor = transform(Image.open(args.input).convert("RGB")).unsqueeze(0).to(device)
     print("Refining trajectory...")
     out_img = _run_one(model, device, img_tensor, args)
-    out_dir = os.path.dirname(args.output)
+    out_path = args.output
+    if not Path(out_path).suffix:
+        out_path = out_path.rstrip("/") + ".png"
+    out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    vutils.save_image(out_img.unsqueeze(0), args.output)
-    print(f"Saved to: {args.output}")
+    vutils.save_image(out_img.unsqueeze(0), out_path)
+    print(f"Saved to: {out_path}")
 
     if args.organize:
         real_sub = os.path.join(out_dir or ".", "real")
         gen_sub = os.path.join(out_dir or ".", "gen")
         os.makedirs(real_sub, exist_ok=True)
         os.makedirs(gen_sub, exist_ok=True)
-        out_stem = Path(args.output).stem
+        out_stem = Path(out_path).stem
         in_ext = Path(args.input).suffix.lower()
         shutil.copy2(args.input, os.path.join(real_sub, out_stem + in_ext))
-        shutil.copy2(args.output, os.path.join(gen_sub, Path(args.output).name))
+        shutil.copy2(out_path, os.path.join(gen_sub, Path(out_path).name))
         print(f"Organized: {real_sub}/ and {gen_sub}/")
 
     if args.run_eval:
@@ -313,11 +316,11 @@ def main():
                 output_path=args.eval_output,
             )
         elif args.real_dir and os.path.isdir(args.real_dir):
-            out_basename = os.path.basename(args.output)
+            out_basename = os.path.basename(out_path)
             print("\nRunning evaluation (Face-Sim, CLIP Score, FID)...")
             from evaluate import run_evaluation
             with tempfile.TemporaryDirectory() as tmp:
-                shutil.copy2(args.output, os.path.join(tmp, out_basename))
+                shutil.copy2(out_path, os.path.join(tmp, out_basename))
                 run_evaluation(
                     real_dir=args.real_dir,
                     gen_dir=tmp,

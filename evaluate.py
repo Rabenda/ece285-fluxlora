@@ -66,20 +66,33 @@ def _list_images(dir_path: str):
     )
 
 
+def _clip_embed_to_tensor(x):
+    """兼容不同 transformers 版本：get_*_features 可能返回 BaseModelOutputWithPooling。"""
+    if isinstance(x, torch.Tensor):
+        return x
+    if hasattr(x, "pooler_output") and x.pooler_output is not None:
+        return x.pooler_output
+    if hasattr(x, "last_hidden_state"):
+        return x.last_hidden_state[:, -1, :]
+    raise ValueError(f"Cannot extract tensor from {type(x)}")
+
+
 def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=STYLE_PROMPT):
     """CLIP Score: 生成图与风格描述之间的余弦相似度（与论文一致），取平均。"""
     clip_model.eval()
     scores = []
-    # 预编码文本（一次）
+    # 预编码文本（一次），用 forward 获取 text_embeds 避免 get_text_features 返回格式不一致
     text_inputs = clip_processor(text=[prompt], return_tensors="pt", padding=True).to(device)
     with torch.no_grad():
-        text_feats = clip_model.get_text_features(**text_inputs)
+        out = clip_model(**text_inputs)
+        text_feats = out.text_embeds if hasattr(out, "text_embeds") else _clip_embed_to_tensor(clip_model.get_text_features(**text_inputs))
         text_feats = F.normalize(text_feats, dim=-1)
     for path in tqdm(image_paths, desc="CLIP Score"):
         img = Image.open(path).convert("RGB")
         inputs = clip_processor(images=img, return_tensors="pt").to(device)
         with torch.no_grad():
-            image_feats = clip_model.get_image_features(**inputs)
+            out = clip_model(**inputs)
+            image_feats = out.image_embeds if hasattr(out, "image_embeds") else _clip_embed_to_tensor(clip_model.get_image_features(**inputs))
             image_feats = F.normalize(image_feats, dim=-1)
             cos_sim = (image_feats * text_feats).sum(dim=-1).item()
             scores.append(cos_sim)
