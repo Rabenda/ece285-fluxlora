@@ -24,17 +24,21 @@ def _flux_unet_accepts_guidance(unet: FluxTransformer2DModel) -> bool:
 
 class FluxI2ITrainable(nn.Module):
     """
-    Full working version (drop-in replacement):
-    - Fixes the "colored checkerboard / moire" collapse by using PixelUnshuffle/Shuffle for packing
-      (instead of fragile view/permute ordering).
-    - Keeps your proto + warmup + flatten target construction.
-    - Ensures dtype consistency (bf16) before feeding FLUX to avoid RMSNorm dtype mismatch slow path.
-    - Preview uses the same token-space x0 estimate and decodes through VAE.
+    Two modes:
+    - mode="full": I2I Rectified Flow (source<->target, endpoint loss, sqrt(t), strong conditioning).
+    - mode="lite":  Legacy noise-conditioned flow (x_t = (1-t)*target + t*noise, target_v = noise - target).
+    Shared: pixel-unshuffle pack, proto + flatten target, bf16-safe.
     """
 
-    def __init__(self, model_id="black-forest-labs/FLUX.1-schnell", proto_pool=32):
+    def __init__(self, model_id="black-forest-labs/FLUX.1-schnell", proto_pool=32, mode="full"):
         super().__init__()
-        print("[FluxI2ITrainable] Init FULL (pixel-unshuffle pack, bf16-safe, cartoonish target)...")
+        self._mode = str(mode).lower()
+        if self._mode not in ("full", "lite"):
+            raise ValueError(f"mode must be 'full' or 'lite', got {mode!r}")
+        if self._mode == "lite":
+            print("[FluxI2ITrainable] Init LITE (noise-conditioned flow, 0.01 conditioning, rand t)...")
+        else:
+            print("[FluxI2ITrainable] Init FULL (I2I Rectified Flow, pixel-unshuffle pack, bf16-safe)...")
 
         # ---------- 0) counters ----------
         self.register_buffer("global_step", torch.zeros((), dtype=torch.long), persistent=True)
@@ -199,6 +203,8 @@ class FluxI2ITrainable(nn.Module):
         force_t=None,
         return_aux=False,
         noise_factor=0.02,
+        a1=0.1,
+        a2=0.05,
     ):
         device = target_image.device
         dtype = torch.bfloat16
@@ -215,17 +221,20 @@ class FluxI2ITrainable(nn.Module):
             vlm_feats = clip_outputs.last_hidden_state   # [B,257,1024]
             vlm_pooled = clip_outputs.pooler_output      # [B,1024]
 
-        # Condition injection（激进释放信号强度，打破保守解）
+        # Condition injection（LITE: 固定 0.01/0.01；FULL: 可传参 a1/a2）
         vlm_proj_out = self.vlm_proj(vlm_feats)
         vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
-        vlm_proj_out = vlm_proj_out * 0.1  # <--- 这里改成 0.1
+        pooled_projections = self.pooled_proj(vlm_pooled)
+        pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
+        if self._mode == "lite":
+            vlm_proj_out = vlm_proj_out * 0.01
+            pooled_projections = pooled_projections * 0.01
+        else:
+            vlm_proj_out = vlm_proj_out * float(a1)
+            pooled_projections = pooled_projections * float(a2)
 
         encoder_hidden_states = torch.zeros((bsz, 512, 4096), device=device, dtype=dtype)
         encoder_hidden_states[:, :257, :] = vlm_proj_out
-
-        pooled_projections = self.pooled_proj(vlm_pooled)  # [B,768]
-        pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
-        pooled_projections = pooled_projections * 0.05  # <--- 这里改成 0.05
         # guidance = torch.full((bsz,), float(guidance_scale), device=device, dtype=dtype)
         guidance = torch.full((bsz,), 0.0, device=device, dtype=dtype)
 
@@ -259,11 +268,123 @@ class FluxI2ITrainable(nn.Module):
 
             target_latents = (z_flat + gamma_eff * bias_up).clamp(-5.0, 5.0).to(dtype)  # [B,16,H,W]
 
-        # --------- 3) Flow training in TOKEN space (I2I Rectified Flow) ----------
-        # x(t) = (1 - t) * target + t * source
-        # dx/dt = source - target
-        # In inference we integrate backward in t, so update is x <- x - v * dt.
         h, w = target_latents.shape[-2], target_latents.shape[-1]
+
+        if self._mode == "lite":
+            # --------- 3) LITE: noise-conditioned flow (x_t = (1-t)*target + t*noise, target_v = noise - target) ----------
+            packed_latents = self._pack(target_latents)
+            noise = torch.randn_like(packed_latents)
+            if force_t is None:
+                t = torch.rand((bsz,), device=device, dtype=dtype)
+            else:
+                if not torch.is_tensor(force_t):
+                    force_t = torch.tensor(float(force_t), device=device, dtype=dtype)
+                t = force_t.to(device=device, dtype=dtype).view(-1)
+                if t.numel() == 1:
+                    t = t.repeat(bsz)
+                elif t.numel() != bsz:
+                    raise ValueError(f"force_t length must be 1 or batch size ({bsz}), got {t.numel()}")
+            x_t = (1.0 - t.view(-1, 1, 1)) * packed_latents + t.view(-1, 1, 1) * noise
+            x_t = x_t.to(dtype)
+            encoder_hidden_states = encoder_hidden_states.to(dtype)
+            pooled_projections = pooled_projections.to(dtype)
+            img_ids, txt_ids = self._get_ids(h, w, device)
+            unet_kw = dict(
+                hidden_states=x_t,
+                encoder_hidden_states=encoder_hidden_states,
+                pooled_projections=pooled_projections,
+                timestep=t,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                return_dict=False,
+            )
+            if self._accepts_guidance:
+                unet_kw["guidance"] = guidance
+            v_pred = self.unet(**unet_kw)[0]
+            v_pred_f = v_pred.float()
+            target_v = (noise - packed_latents).float()
+            loss = F.mse_loss(v_pred_f, target_v)
+
+            def _print_diagnostics_lite(tag):
+                print(f"[{tag}]")
+                print("  t mean:", t.float().mean().item())
+                print("  gamma:", float(gamma), "gamma_eff:", float(gamma_eff))
+                print("  packed_latents absmax:", packed_latents.float().abs().max().item())
+                print("  x_t absmax:", x_t.float().abs().max().item())
+                print("  v_pred absmax:", v_pred_f.abs().max().item(), "mean abs:", v_pred_f.abs().mean().item())
+                print("  target_v absmax:", target_v.abs().max().item(), "mean abs:", target_v.abs().mean().item())
+                print("  vlm_proj_out absmax:", vlm_proj_out.float().abs().max().item())
+                print("  enc_hidden absmax:", encoder_hidden_states.float().abs().max().item())
+                print("  pooled_proj absmax:", pooled_projections.float().abs().max().item())
+
+            if not torch.isfinite(loss):
+                self._last_spike_info = {
+                    "rf_loss": float("nan"),
+                    "v_pred_absmax": v_pred_f.abs().max().item(),
+                    "target_v_absmax": target_v.abs().max().item(),
+                    "t_mean": t.float().mean().item(),
+                    "vlm_proj_out_absmax": vlm_proj_out.float().abs().max().item(),
+                    "enc_hidden_absmax": encoder_hidden_states.float().abs().max().item(),
+                    "pooled_proj_absmax": pooled_projections.float().abs().max().item(),
+                    "trigger": "non_finite",
+                }
+                if self._bad_print_count < 5:
+                    _print_diagnostics_lite("BAD non-finite loss")
+                    self._bad_print_count += 1
+                if return_aux:
+                    return None, None, None
+                return None, None
+            if loss.item() > 1000.0:
+                if self._spike_print_count < 5:
+                    _print_diagnostics_lite("SPIKE loss > 1000")
+                    self._spike_print_count += 1
+                self._last_spike_info = {
+                    "rf_loss": loss.item(),
+                    "v_pred_absmax": v_pred_f.abs().max().item(),
+                    "target_v_absmax": target_v.abs().max().item(),
+                    "t_mean": t.float().mean().item(),
+                    "trigger": "loss",
+                }
+            else:
+                self._last_spike_info = None
+
+            need_preview_grad = self.training and return_aux
+            preview_ctx = nullcontext() if need_preview_grad else torch.no_grad()
+            with preview_ctx:
+                t_p = torch.full((bsz,), float(preview_t), device=device, dtype=dtype)
+                noise_p = torch.randn_like(packed_latents)
+                x_tp = (1.0 - t_p.view(-1, 1, 1)) * packed_latents + t_p.view(-1, 1, 1) * noise_p
+                x_tp = x_tp.to(dtype)
+                unet_kw_p = dict(
+                    hidden_states=x_tp,
+                    encoder_hidden_states=encoder_hidden_states,
+                    pooled_projections=pooled_projections,
+                    timestep=t_p,
+                    img_ids=img_ids,
+                    txt_ids=txt_ids,
+                    return_dict=False,
+                )
+                if self._accepts_guidance:
+                    unet_kw_p["guidance"] = guidance
+                v_p = self.unet(**unet_kw_p)[0]
+                x0 = x_tp - t_p.view(-1, 1, 1) * v_p
+                out_latents = self._unpack(x0, h, w).float().clamp(-5.0, 5.0)
+                out_latents = (out_latents / self.scaling_factor) + self.vae.config.shift_factor
+                out_image = self.vae.decode(out_latents).sample
+            if not return_aux:
+                return loss, out_image
+            aux = {
+                "sampled_t": t.detach(),
+                "packed_latents": packed_latents.detach(),
+                "v_pred_absmax": v_pred_f.abs().max().detach().item(),
+                "target_v_absmax": target_v.abs().max().detach().item(),
+                "source_preview": out_image.detach(),  # LITE 无独立 source-end，用预览图兼容 Stage3 id_loss
+            }
+            return loss, out_image, aux
+
+        # --------- 3) FULL: I2I Rectified Flow ----------
+        # x(t) = (1 - t) * target + t * source, dx/dt = source - target
+        # In inference we integrate backward in t, so update is x <- x - v * dt.
         packed_target = self._pack(target_latents)   # t=0
         packed_real = self._pack(z_real)             # real source anchor
         noise = torch.randn_like(packed_real)

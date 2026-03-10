@@ -52,12 +52,15 @@ def parse_args():
     p.add_argument("--input_dir", type=str, default=None, help="批量：原图目录。与 --output_dir 同时指定时启用批量。")
     p.add_argument("--output_dir", type=str, default=None, help="批量：结果目录，将创建 real/ 与 gen/ 子目录并自动整理。")
     p.add_argument("--organize", action="store_true", help="单张模式：在 output 所在目录下创建 real/ 与 gen/ 并整理，便于评估。")
-    p.add_argument("--t_stop", type=float, default=0.0, help="多步推理从 t=1 积分到 t_stop。越小越卡通，越大越保守。")
+    p.add_argument("--t_stop", type=float, default=0.0, help="[FULL] 多步从 t=1 积分到 t_stop。越小越卡通。")
+    p.add_argument("--t0", type=float, default=0.5, help="[LITE] 多步起始时间 t0，dt=t0/steps。")
     p.add_argument("--steps", type=int, default=20, help="ODE 积分步数。")
-    p.add_argument("--single_step", action="store_true", help="source-end 单步 probe，不跑多步。")
-    p.add_argument("--single_step_t", type=float, default=0.15, help="单步 probe 的 step_scale，控制步长。")
-    p.add_argument("--noise_factor", type=float, default=0.02, help="起点 latent 加的噪声比例，与训练一致。")
-    p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it (older diffusers/FLUX). For diffusers>=0.30 + FLUX.1-schnell, 此值會被自動忽略。")
+    p.add_argument("--single_step", action="store_true", help="单步模式（FULL=source-end probe，LITE=preview 同款）。")
+    p.add_argument("--single_step_t", type=float, default=0.15, help="单步步长/step_scale。")
+    p.add_argument("--noise_factor", type=float, default=0.02, help="[FULL] 起点 latent 噪声比例。")
+    p.add_argument("--cond_scale_vlm", type=float, default=0.1, help="[FULL] 条件缩放 a1（vlm）。")
+    p.add_argument("--cond_scale_pooled", type=float, default=0.05, help="[FULL] 条件缩放 a2（pooled）。")
+    p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it. Schnell 推理时自动忽略。")
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--run_eval", action="store_true", help="推理并整理后跑 Face-Sim / CLIP Score / FID。")
@@ -67,21 +70,16 @@ def parse_args():
     return p.parse_args()
 
 
-def _run_one(model, device, img_tensor, t_stop, steps, guidance, single_step=False, single_step_t=0.2, noise_factor=0.02):
+def _run_one(model, device, img_tensor, args):
     """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (C,H,W) 在 [0,1]。
-    I2I Rectified Flow：起点 = 真人 latent + 微量噪声 (t=1)，积分到 t=t_stop。
-    控制风格强度靠 t_stop：0=强卡通，0.5=轻风格。
+    根据 model._mode 选 FULL（I2I RF, t_stop/a1/a2）或 LITE（noise-conditioned, t0）。
     """
-    steps = max(1, int(steps))
+    steps = max(1, int(args.steps))
+    is_lite = getattr(model, "_mode", "full") == "lite"
     with torch.no_grad():
         latents = model.vae.encode(img_tensor.to(torch.float32)).latent_dist.mode()
         latents = (latents - model.vae.config.shift_factor) * model.scaling_factor
         h, w = latents.shape[-2], latents.shape[-1]
-        packed_real = model._pack(latents).to(torch.bfloat16)
-        noise = torch.randn_like(packed_real)
-        packed_source = packed_real + noise_factor * noise
-        x_t = packed_source.clone()
-
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
             clip_in = F.interpolate((img_tensor + 1.0) / 2.0, size=(224, 224), mode="bilinear", align_corners=False)
             clip_in = (clip_in - model.clip_mean.to(img_tensor.device)) / model.clip_std.to(img_tensor.device)
@@ -89,44 +87,30 @@ def _run_one(model, device, img_tensor, t_stop, steps, guidance, single_step=Fal
             vlm_feats_raw = clip_outputs.last_hidden_state
             vlm_proj_out = model.vlm_proj(vlm_feats_raw)
             vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
-            vlm_proj_out = vlm_proj_out * 0.1
             pooled_raw = clip_outputs.pooler_output
             pooled_projections = model.pooled_proj(pooled_raw)
             pooled_projections = F.layer_norm(pooled_projections, (pooled_projections.shape[-1],))
-            pooled_projections = pooled_projections * 0.05
-
+            if is_lite:
+                vlm_proj_out = vlm_proj_out * 0.01
+                pooled_projections = pooled_projections * 0.01
+            else:
+                vlm_proj_out = vlm_proj_out * args.cond_scale_vlm
+                pooled_projections = pooled_projections * args.cond_scale_pooled
         encoder_hidden_states = torch.zeros((1, 512, 4096), device=device, dtype=torch.bfloat16)
         encoder_hidden_states[:, :257, :] = vlm_proj_out.to(torch.bfloat16)
         img_ids, txt_ids = model._get_ids(h, w, device)
         guidance_t = torch.full((1,), 0.0, device=device, dtype=torch.bfloat16)
 
-    with torch.no_grad():
-        if single_step:
-            # source-end probe：状态是 source，时间标签必须是 1.0
-            t_tensor = torch.full((1,), 1.0, device=device, dtype=torch.bfloat16)
-            unet_kw = dict(
-                hidden_states=x_t.to(torch.bfloat16),
-                encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
-                pooled_projections=pooled_projections.to(torch.bfloat16),
-                timestep=t_tensor,
-                img_ids=img_ids.to(torch.bfloat16),
-                txt_ids=txt_ids.to(torch.bfloat16),
-                return_dict=False,
-            )
-            if getattr(model, "_accepts_guidance", False):
-                unet_kw["guidance"] = guidance_t
-            v_pred = model.unet(**unet_kw)[0]
-            v_pred = torch.nan_to_num(v_pred, nan=0.0)
-            step_scale = max(1e-4, min(1.0, float(single_step_t)))
-            x_t = x_t - step_scale * v_pred
-        else:
-            # 从 t=1.0 走到 t=t_stop，控制风格强度靠提前停下
-            t_stop = max(0.0, min(1.0, float(t_stop)))
-            total_span = 1.0 - t_stop
-            dt = total_span / steps
-            for i in range(steps):
-                current_t = 1.0 - i * dt
-                t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
+    if is_lite:
+        # LITE: x_t = (1-t)*x_start + t*noise, 多步 dt=t0/steps
+        with torch.no_grad():
+            x_start = model._pack(latents).to(torch.bfloat16)
+            noise = torch.randn_like(x_start)
+            t_use = float(args.single_step_t) if args.single_step else float(args.t0)
+            x_t = (1.0 - t_use) * x_start + t_use * noise
+        with torch.no_grad():
+            if args.single_step:
+                t_tensor = torch.full((1,), t_use, device=device, dtype=torch.bfloat16)
                 unet_kw = dict(
                     hidden_states=x_t.to(torch.bfloat16),
                     encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
@@ -140,7 +124,72 @@ def _run_one(model, device, img_tensor, t_stop, steps, guidance, single_step=Fal
                     unet_kw["guidance"] = guidance_t
                 v_pred = model.unet(**unet_kw)[0]
                 v_pred = torch.nan_to_num(v_pred, nan=0.0)
-                x_t = x_t - v_pred * dt
+                x_t = x_t - t_tensor.view(-1, 1, 1) * v_pred
+            else:
+                dt = args.t0 / steps
+                for i in range(steps):
+                    current_t = args.t0 * (1 - i / steps)
+                    t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
+                    unet_kw = dict(
+                        hidden_states=x_t.to(torch.bfloat16),
+                        encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
+                        pooled_projections=pooled_projections.to(torch.bfloat16),
+                        timestep=t_tensor,
+                        img_ids=img_ids.to(torch.bfloat16),
+                        txt_ids=txt_ids.to(torch.bfloat16),
+                        return_dict=False,
+                    )
+                    if getattr(model, "_accepts_guidance", False):
+                        unet_kw["guidance"] = guidance_t
+                    v_pred = model.unet(**unet_kw)[0]
+                    v_pred = torch.nan_to_num(v_pred, nan=0.0)
+                    x_t = x_t - v_pred * dt
+    else:
+        # FULL: I2I RF，起点 packed_source，从 t=1 积到 t_stop
+        with torch.no_grad():
+            packed_real = model._pack(latents).to(torch.bfloat16)
+            noise = torch.randn_like(packed_real)
+            packed_source = packed_real + args.noise_factor * noise
+            x_t = packed_source.clone()
+        with torch.no_grad():
+            if args.single_step:
+                t_tensor = torch.full((1,), 1.0, device=device, dtype=torch.bfloat16)
+                unet_kw = dict(
+                    hidden_states=x_t.to(torch.bfloat16),
+                    encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
+                    pooled_projections=pooled_projections.to(torch.bfloat16),
+                    timestep=t_tensor,
+                    img_ids=img_ids.to(torch.bfloat16),
+                    txt_ids=txt_ids.to(torch.bfloat16),
+                    return_dict=False,
+                )
+                if getattr(model, "_accepts_guidance", False):
+                    unet_kw["guidance"] = guidance_t
+                v_pred = model.unet(**unet_kw)[0]
+                v_pred = torch.nan_to_num(v_pred, nan=0.0)
+                step_scale = max(1e-4, min(1.0, float(args.single_step_t)))
+                x_t = x_t - step_scale * v_pred
+            else:
+                t_stop = max(0.0, min(1.0, float(args.t_stop)))
+                total_span = 1.0 - t_stop
+                dt = total_span / steps
+                for i in range(steps):
+                    current_t = 1.0 - i * dt
+                    t_tensor = torch.full((1,), current_t, device=device, dtype=torch.bfloat16)
+                    unet_kw = dict(
+                        hidden_states=x_t.to(torch.bfloat16),
+                        encoder_hidden_states=encoder_hidden_states.to(torch.bfloat16),
+                        pooled_projections=pooled_projections.to(torch.bfloat16),
+                        timestep=t_tensor,
+                        img_ids=img_ids.to(torch.bfloat16),
+                        txt_ids=txt_ids.to(torch.bfloat16),
+                        return_dict=False,
+                    )
+                    if getattr(model, "_accepts_guidance", False):
+                        unet_kw["guidance"] = guidance_t
+                    v_pred = model.unet(**unet_kw)[0]
+                    v_pred = torch.nan_to_num(v_pred, nan=0.0)
+                    x_t = x_t - v_pred * dt
 
     with torch.no_grad():
         out_latents = model._unpack(x_t, h, w).to(torch.float32)
@@ -179,14 +228,16 @@ def main():
         mode_label = "Stage1 (no ckpt)" if args.checkpoint is None else f"Stage2/3 (ckpt: {args.checkpoint})"
         print(f"[Inference] Single image ({mode_label}).")
 
-    if args.checkpoint is None:
-        print("Loading pretrained model only (NO checkpoint).")
-    else:
-        print(f"Loading model from checkpoint: {args.checkpoint}")
-    model = FluxI2ITrainable().to(device)
-    model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
+    ckpt = None
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
+        print(f"Loading model from checkpoint: {args.checkpoint}")
+    else:
+        print("Loading pretrained model only (NO checkpoint).")
+    mode = ckpt.get("mode", "full") if isinstance(ckpt, dict) else "full"
+    model = FluxI2ITrainable(mode=mode).to(device)
+    model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
+    if ckpt is not None:
         if isinstance(ckpt, dict):
             # 優先載入 LoRA 權重（新格式）
             if "lora" in ckpt:
@@ -204,7 +255,7 @@ def main():
             model.load_state_dict(ckpt, strict=False)
     model.vae.to(torch.float32)
     model.eval()
-    print(f"[Inference] UNet accepts guidance: {getattr(model, '_accepts_guidance', False)}")
+    print(f"[Inference] mode={mode}, UNet accepts guidance: {getattr(model, '_accepts_guidance', False)}")
 
     if batch_mode:
         for name in tqdm(image_names, desc="Inference"):
@@ -212,7 +263,7 @@ def main():
             stem = Path(name).stem
             ext = Path(name).suffix.lower()
             img_tensor = transform(Image.open(inp_path).convert("RGB")).unsqueeze(0).to(device)
-            out_img = _run_one(model, device, img_tensor, args.t_stop, args.steps, args.guidance, args.single_step, args.single_step_t, noise_factor=args.noise_factor)
+            out_img = _run_one(model, device, img_tensor, args)
             gen_path = os.path.join(gen_dir, stem + ".png")
             vutils.save_image(out_img.unsqueeze(0), gen_path)
             shutil.copy2(inp_path, os.path.join(real_dir, stem + ext))
@@ -231,7 +282,7 @@ def main():
     # 单张模式
     img_tensor = transform(Image.open(args.input).convert("RGB")).unsqueeze(0).to(device)
     print("Refining trajectory...")
-    out_img = _run_one(model, device, img_tensor, args.t_stop, args.steps, args.guidance, args.single_step, args.single_step_t, noise_factor=args.noise_factor)
+    out_img = _run_one(model, device, img_tensor, args)
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

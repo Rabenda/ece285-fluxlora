@@ -1,19 +1,23 @@
 """
 Stage2 / Stage3 训练脚本。Stage1 为仅推理基线，见 inference.py（不传 --checkpoint）。
 
-数据：--train_dir 下需有 real/ 与 cartoon/ 两个子目录（可用 scripts/download_stable_faces.py 准备）。
-训练完成后用 inference.py 加载 checkpoint 做推理；其他同学只需跑本脚本 + inference.py 即可复现。
+支持两种模型架构（--mode）：
+- full：I2I Rectified Flow（source/target、endpoint loss、t_stop 推理）
+- lite：noise-conditioned flow（x_t = (1-t)*target + t*noise，t0 推理）
 
-# Stage2：仅 LoRA（流损失）
-python train_cartoon.py --stage stage2 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
+数据：--train_dir 下需有 real/ 与 cartoon/ 两个子目录。
 
-# Stage3：LoRA + 身份损失（推荐）
-python train_cartoon.py --stage stage3 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
+# FULL 模式（推荐）
+python train_cartoon.py --mode full --stage stage3 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
 
-# 从已有 checkpoint 续训
+# LITE 模式
+python train_cartoon.py --mode lite --stage stage3 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
+
+# Stage2：仅 LoRA
+python train_cartoon.py --mode full --stage stage2 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
+
+# 续训 / 自检
 python train_cartoon.py --stage stage3 --train_dir ./data --resume
-
-# 训练前做环境自检（可选）
 python train_cartoon.py --stage stage3 --train_dir ./data --sanity_check
 """
 import argparse
@@ -76,8 +80,9 @@ def parse_args():
     parser.add_argument("--save_interval_step", type=int, default=50)
     parser.add_argument("--preview_interval_step", type=int, default=50, help="每 N 步存 interp_preview 与 source_preview。")
     parser.add_argument("--infer_interval_step", type=int, default=50, help="每 N 步存 compare（含 single/multi-step infer）与 infer_step_*.png。")
-    parser.add_argument("--sample_t_stop", type=float, default=0.0, help="multi-step infer 从 t=1 积分到 t_stop；越小越卡通。")
-    parser.add_argument("--sample_steps", type=int, default=20, help="multi-step infer 的 ODE 步数。")
+    parser.add_argument("--sample_t_stop", type=float, default=0.0, help="[FULL] multi-step 从 t=1 积分到 t_stop。")
+    parser.add_argument("--sample_t0", type=float, default=0.5, help="[LITE] multi-step 起始 t0。")
+    parser.add_argument("--sample_steps", type=int, default=20, help="infer 的 ODE 步数。")
     parser.add_argument("--sample_single_step_t", type=float, default=0.15, help="single-step probe 的步长，与 source_preview 语义一致。")
     parser.add_argument("--source_preview_step", type=float, default=0.15, help="source-end preview 步长，独立于 interpolation preview_t。")
     parser.add_argument("--noise_factor", type=float, default=0.02, help="起点 latent 噪声比例，与训练一致。")
@@ -87,6 +92,9 @@ def parse_args():
     parser.add_argument("--gamma_end", type=float, default=0.3, help="gamma 调度终点；新实验 A 建议 0.3。")
     parser.add_argument("--gamma_warmup_steps", type=int, default=300, help="gamma warmup 步数。")
     parser.add_argument("--mix_cartoon_latent", type=float, default=0.6, help="target 中 cartoon 混合比例；0.6 让 target 更明确，利于稳定。")
+    parser.add_argument("--mode", type=str, default="full", choices=["full", "lite"], help="FluxI2ITrainable: full=I2I Rectified Flow, lite=noise-conditioned flow.")
+    parser.add_argument("--a1", type=float, default=0.1, help="[FULL] 条件缩放 a1（vlm_proj），LITE 忽略。")
+    parser.add_argument("--a2", type=float, default=0.05, help="[FULL] 条件缩放 a2（pooled_proj），LITE 忽略。")
     parser.add_argument("--stage", type=str, default="stage3", choices=["stage2", "stage3"], help="stage2: LoRA only; stage3: LoRA + identity loss.")
     parser.add_argument("--lambda0", type=float, default=0.6, help="Identity loss base weight in stage3.")
     parser.add_argument("--lambda_p", type=float, default=2.0, help="Time-dependent exponent in stage3.")
@@ -137,8 +145,8 @@ def main():
         with open(spike_log_path, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
-    print(f"Loading model for {args.stage} ...")
-    model = FluxI2ITrainable().to(device)
+    print(f"Loading model for {args.stage} (mode={args.mode}) ...")
+    model = FluxI2ITrainable(mode=args.mode).to(device)
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
     if not args.train_projection:
         model.vlm_proj.requires_grad_(False)
@@ -200,6 +208,9 @@ def main():
                 if "optimizer_state_dict" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 global_step = ckpt.get("global_step", 0)
+                ckpt_mode = ckpt.get("mode", "full")
+                if ckpt_mode != args.mode:
+                    print(f"[Warning] Checkpoint was saved with mode={ckpt_mode}, current --mode={args.mode}. Ensure consistency.")
 
     # 保存当前 LoRA 状态作为“初始”参考（resume 时则为“本次运行起点”），用于 diff 诊断
     init_lora_state = {}
@@ -241,6 +252,8 @@ def main():
                         return_aux=True,
                         noise_factor=args.noise_factor,
                         source_preview_step=args.source_preview_step,
+                        a1=args.a1,
+                        a2=args.a2,
                     )
                 else:
                     rf_loss, preview, aux = model(
@@ -251,6 +264,8 @@ def main():
                         return_aux=True,
                         noise_factor=args.noise_factor,
                         source_preview_step=args.source_preview_step,
+                        a1=args.a1,
+                        a2=args.a2,
                     )
 
                 if rf_loss is None or preview is None or (not torch.isfinite(rf_loss)):
@@ -375,6 +390,7 @@ def main():
                             target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma,
                             mix_cartoon_latent=args.mix_cartoon_latent, return_aux=True,
                             noise_factor=args.noise_factor, source_preview_step=args.source_preview_step,
+                            a1=args.a1, a2=args.a2,
                         )
                         if preview is not None:
                             save_preview_images(preview, os.path.join(args.samples_dir, f"interp_preview_step_{global_step:06d}.png"))
@@ -390,15 +406,21 @@ def main():
                             target_image=fixed_cartoon, cond_image=fixed_real, gamma=gamma,
                             mix_cartoon_latent=args.mix_cartoon_latent, return_aux=True,
                             noise_factor=args.noise_factor, source_preview_step=args.source_preview_step,
+                            a1=args.a1, a2=args.a2,
                         )
-                        infer_single = run_inference_one(
-                            model, device, fixed_real[0:1], args.sample_t_stop, args.sample_steps, 1.0,
-                            single_step=True, single_step_t=args.sample_single_step_t, noise_factor=args.noise_factor,
-                        )
-                        infer_multi = run_inference_one(
-                            model, device, fixed_real[0:1], args.sample_t_stop, args.sample_steps, 1.0,
+                        _infer_args = argparse.Namespace(
+                            steps=args.sample_steps,
+                            t_stop=args.sample_t_stop,
+                            t0=args.sample_t0,
                             noise_factor=args.noise_factor,
+                            cond_scale_vlm=args.a1,
+                            cond_scale_pooled=args.a2,
+                            single_step_t=args.sample_single_step_t,
                         )
+                        _infer_args.single_step = True
+                        infer_single = run_inference_one(model, device, fixed_real[0:1], _infer_args)
+                        _infer_args.single_step = False
+                        infer_multi = run_inference_one(model, device, fixed_real[0:1], _infer_args)
                     real_01 = (fixed_real[0].float().cpu() + 1.0) / 2.0
                     interp_preview_01 = (preview[0].float().cpu().clamp(-1, 1) + 1.0) / 2.0 if preview is not None else real_01
                     source_preview_01 = (aux["source_preview"][0].float().cpu().clamp(-1, 1) + 1.0) / 2.0 if "source_preview" in aux else interp_preview_01
@@ -421,6 +443,7 @@ def main():
                             "pooled_proj": model.pooled_proj.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "stage": args.stage,
+                            "mode": args.mode,
                             "lambda0": args.lambda0,
                             "lambda_p": args.lambda_p,
                         },
@@ -476,6 +499,7 @@ def main():
             "pooled_proj": model.pooled_proj.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "stage": args.stage,
+            "mode": args.mode,
             "lambda0": args.lambda0,
             "lambda_p": args.lambda_p,
         },
