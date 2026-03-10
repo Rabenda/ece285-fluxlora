@@ -208,9 +208,11 @@ def main():
                 if "optimizer_state_dict" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 global_step = ckpt.get("global_step", 0)
-                ckpt_mode = ckpt.get("mode", "full")
-                if ckpt_mode != args.mode:
-                    print(f"[Warning] Checkpoint was saved with mode={ckpt_mode}, current --mode={args.mode}. Ensure consistency.")
+                ckpt_mode = ckpt.get("mode", None)
+                if ckpt_mode is not None and ckpt_mode != args.mode:
+                    print(f"[Resume] Checkpoint mode={ckpt_mode} overrides --mode={args.mode}. Using mode={ckpt_mode} for training and saves.")
+                    args.mode = ckpt_mode
+                    model._mode = str(ckpt_mode).lower()
 
     # 保存当前 LoRA 状态作为“初始”参考（resume 时则为“本次运行起点”），用于 diff 诊断
     init_lora_state = {}

@@ -234,7 +234,13 @@ def main():
         print(f"Loading model from checkpoint: {args.checkpoint}")
     else:
         print("Loading pretrained model only (NO checkpoint).")
-    mode = ckpt.get("mode", "full") if isinstance(ckpt, dict) else "full"
+    # 若 checkpoint 未保存 mode（旧版 LITE 训练），从路径推断，否则 LITE 权重会被当成 FULL 推理导致异常
+    if isinstance(ckpt, dict) and "mode" in ckpt:
+        mode = ckpt["mode"]
+    elif args.checkpoint and "lite" in args.checkpoint.lower():
+        mode = "lite"
+    else:
+        mode = "full"
     model = FluxI2ITrainable(mode=mode).to(device)
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
     if ckpt is not None:
