@@ -187,9 +187,12 @@ def run_evaluation(
     else:
         results["face_sim"] = None
 
-    if reference_dir and os.path.isdir(reference_dir) and HAS_FID:
+    # FID 需要两边至少各 2 张图；单张生成图时跳过
+    if reference_dir and os.path.isdir(reference_dir) and HAS_FID and len(gen_paths) >= 2:
         results["fid"] = compute_fid(gen_dir, reference_dir, device, max_ref=max_fid_ref, max_gen=max_fid_gen)
     else:
+        if reference_dir and HAS_FID and len(gen_paths) < 2:
+            print("FID skipped: need at least 2 generated images (single-image mode).")
         results["fid"] = None
 
     if output_path:
