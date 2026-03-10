@@ -66,14 +66,24 @@ def _list_images(dir_path: str):
     )
 
 
-def _clip_embed_to_tensor(x):
-    """兼容不同 transformers 版本：get_*_features 可能返回 BaseModelOutputWithPooling。"""
+def _clip_embed_to_tensor(x, clip_model=None, is_text=True):
+    """兼容不同 transformers 版本：get_*_features 可能返回 BaseModelOutputWithPooling。
+    若返回 pooler_output（未投影），需用 clip_model 的 text_projection/visual_projection 投影到共享空间。
+    """
     if isinstance(x, torch.Tensor):
         return x
+    raw = None
     if hasattr(x, "pooler_output") and x.pooler_output is not None:
-        return x.pooler_output
-    if hasattr(x, "last_hidden_state"):
-        return x.last_hidden_state[:, -1, :]
+        raw = x.pooler_output
+    elif hasattr(x, "last_hidden_state"):
+        raw = x.last_hidden_state[:, -1, :]
+    if raw is not None:
+        if clip_model is not None:
+            name = "text_projection" if is_text else "visual_projection"
+            proj = getattr(clip_model, name, None) or getattr(clip_model, "vision_projection", None)
+            if proj is not None:
+                return proj(raw)
+        return raw
     raise ValueError(f"Cannot extract tensor from {type(x)}")
 
 
@@ -81,18 +91,16 @@ def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=S
     """CLIP Score: 生成图与风格描述之间的余弦相似度（与论文一致），取平均。"""
     clip_model.eval()
     scores = []
-    # 预编码文本（一次），用 forward 获取 text_embeds 避免 get_text_features 返回格式不一致
+    # 预编码文本（一次）。必须用 get_text_features，不能用 forward（forward 会要求 pixel_values）
     text_inputs = clip_processor(text=[prompt], return_tensors="pt", padding=True).to(device)
     with torch.no_grad():
-        out = clip_model(**text_inputs)
-        text_feats = out.text_embeds if hasattr(out, "text_embeds") else _clip_embed_to_tensor(clip_model.get_text_features(**text_inputs))
+        text_feats = _clip_embed_to_tensor(clip_model.get_text_features(**text_inputs), clip_model, is_text=True)
         text_feats = F.normalize(text_feats, dim=-1)
     for path in tqdm(image_paths, desc="CLIP Score"):
         img = Image.open(path).convert("RGB")
         inputs = clip_processor(images=img, return_tensors="pt").to(device)
         with torch.no_grad():
-            out = clip_model(**inputs)
-            image_feats = out.image_embeds if hasattr(out, "image_embeds") else _clip_embed_to_tensor(clip_model.get_image_features(**inputs))
+            image_feats = _clip_embed_to_tensor(clip_model.get_image_features(**inputs), clip_model, is_text=False)
             image_feats = F.normalize(image_feats, dim=-1)
             cos_sim = (image_feats * text_feats).sum(dim=-1).item()
             scores.append(cos_sim)
