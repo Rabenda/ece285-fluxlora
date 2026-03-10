@@ -91,16 +91,23 @@ def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=S
     """CLIP Score: 生成图与风格描述之间的余弦相似度（与论文一致），取平均。"""
     clip_model.eval()
     scores = []
-    # 预编码文本（一次）。必须用 get_text_features，不能用 forward（forward 会要求 pixel_values）
+    # 预编码文本（一次）。只传 input_ids/attention_mask，避免混入其他字段
     text_inputs = clip_processor(text=[prompt], return_tensors="pt", padding=True).to(device)
     with torch.no_grad():
-        text_feats = _clip_embed_to_tensor(clip_model.get_text_features(**text_inputs), clip_model, is_text=True)
+        text_feats = _clip_embed_to_tensor(
+            clip_model.get_text_features(input_ids=text_inputs["input_ids"], attention_mask=text_inputs.get("attention_mask")),
+            clip_model, is_text=True,
+        )
         text_feats = F.normalize(text_feats, dim=-1)
     for path in tqdm(image_paths, desc="CLIP Score"):
         img = Image.open(path).convert("RGB")
         inputs = clip_processor(images=img, return_tensors="pt").to(device)
         with torch.no_grad():
-            image_feats = _clip_embed_to_tensor(clip_model.get_image_features(**inputs), clip_model, is_text=False)
+            # 只传 pixel_values！processor 可能返回 input_ids，若 **inputs 会误走 text 分支导致维度错误
+            image_feats = _clip_embed_to_tensor(
+                clip_model.get_image_features(pixel_values=inputs["pixel_values"]),
+                clip_model, is_text=False,
+            )
             image_feats = F.normalize(image_feats, dim=-1)
             cos_sim = (image_feats * text_feats).sum(dim=-1).item()
             scores.append(cos_sim)
