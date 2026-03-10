@@ -66,48 +66,31 @@ def _list_images(dir_path: str):
     )
 
 
-def _clip_embed_to_tensor(x, clip_model=None, is_text=True):
-    """兼容不同 transformers 版本：get_*_features 可能返回 BaseModelOutputWithPooling。
-    若返回 pooler_output（未投影），需用 clip_model 的 text_projection/visual_projection 投影到共享空间。
-    """
-    if isinstance(x, torch.Tensor):
-        return x
-    raw = None
-    if hasattr(x, "pooler_output") and x.pooler_output is not None:
-        raw = x.pooler_output
-    elif hasattr(x, "last_hidden_state"):
-        raw = x.last_hidden_state[:, -1, :]
-    if raw is not None:
-        if clip_model is not None:
-            name = "text_projection" if is_text else "visual_projection"
-            proj = getattr(clip_model, name, None) or getattr(clip_model, "vision_projection", None)
-            if proj is not None:
-                return proj(raw)
-        return raw
-    raise ValueError(f"Cannot extract tensor from {type(x)}")
-
-
 def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=STYLE_PROMPT):
-    """CLIP Score: 生成图与风格描述之间的余弦相似度（与论文一致），取平均。"""
+    """CLIP Score: 生成图与风格描述之间的余弦相似度（与论文一致），取平均。
+    直接调用 text_model/vision_model + 投影，避免 get_*_features 在不同 transformers 版本中的不一致行为。
+    """
     clip_model.eval()
     scores = []
-    # 预编码文本（一次）。只传 input_ids/attention_mask，避免混入其他字段
+    # 文本：text_model -> pooler_output -> text_projection
     text_inputs = clip_processor(text=[prompt], return_tensors="pt", padding=True).to(device)
     with torch.no_grad():
-        text_feats = _clip_embed_to_tensor(
-            clip_model.get_text_features(input_ids=text_inputs["input_ids"], attention_mask=text_inputs.get("attention_mask")),
-            clip_model, is_text=True,
+        text_out = clip_model.text_model(
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs.get("attention_mask"),
         )
+        text_pooled = text_out.pooler_output if text_out.pooler_output is not None else text_out.last_hidden_state[:, 0, :]
+        text_feats = clip_model.text_projection(text_pooled)
         text_feats = F.normalize(text_feats, dim=-1)
+    # 图像：vision_model -> pooler_output -> visual_projection
+    vis_proj = getattr(clip_model, "visual_projection", None) or getattr(clip_model, "vision_projection", None)
     for path in tqdm(image_paths, desc="CLIP Score"):
         img = Image.open(path).convert("RGB")
         inputs = clip_processor(images=img, return_tensors="pt").to(device)
         with torch.no_grad():
-            # 只传 pixel_values！processor 可能返回 input_ids，若 **inputs 会误走 text 分支导致维度错误
-            image_feats = _clip_embed_to_tensor(
-                clip_model.get_image_features(pixel_values=inputs["pixel_values"]),
-                clip_model, is_text=False,
-            )
+            vision_out = clip_model.vision_model(pixel_values=inputs["pixel_values"])
+            vision_pooled = vision_out.pooler_output if vision_out.pooler_output is not None else vision_out.last_hidden_state[:, 0, :]
+            image_feats = vis_proj(vision_pooled)
             image_feats = F.normalize(image_feats, dim=-1)
             cos_sim = (image_feats * text_feats).sum(dim=-1).item()
             scores.append(cos_sim)
