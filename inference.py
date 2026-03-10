@@ -269,13 +269,14 @@ def main():
             shutil.copy2(inp_path, os.path.join(real_dir, stem + ext))
         print(f"Inference: {len(image_names)} images saved under {args.output_dir}/real/ and .../gen/")
         if args.run_eval:
+            eval_output = args.eval_output or os.path.join(args.output_dir, "eval_metrics.json")
             print("\nRunning evaluation (Face-Sim, CLIP Score, FID)...")
             from evaluate import run_evaluation
             run_evaluation(
                 real_dir=real_dir,
                 gen_dir=gen_dir,
                 reference_dir=args.reference_dir,
-                output_path=args.eval_output,
+                output_path=eval_output,
             )
         return
 
@@ -304,6 +305,7 @@ def main():
         print(f"Organized: {real_sub}/ and {gen_sub}/")
 
     if args.run_eval:
+        eval_output = args.eval_output or (os.path.join(out_dir, "eval_metrics.json") if out_dir else "./eval_metrics.json")
         if args.organize and out_dir:
             real_dir = os.path.join(out_dir, "real")
             gen_dir = os.path.join(out_dir, "gen")
@@ -313,7 +315,7 @@ def main():
                 real_dir=real_dir,
                 gen_dir=gen_dir,
                 reference_dir=args.reference_dir,
-                output_path=args.eval_output,
+                output_path=eval_output,
             )
         elif args.real_dir and os.path.isdir(args.real_dir):
             out_basename = os.path.basename(out_path)
@@ -325,7 +327,7 @@ def main():
                     real_dir=args.real_dir,
                     gen_dir=tmp,
                     reference_dir=args.reference_dir,
-                    output_path=args.eval_output,
+                    output_path=eval_output,
                 )
         else:
             print("Skipping evaluation: use --organize or --real_dir (and ensure output is in a dir) for --run_eval.")
