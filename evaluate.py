@@ -1,13 +1,12 @@
 """
-统一评估脚本：Face-Sim、CLIP Score、FID。
-可供 Stage1 / Stage2 / Stage3 的 inference 输出共用。
+Unified evaluation: Face-Sim, CLIP Score, FID. Shared by Stage1 / Stage2 / Stage3 inference outputs.
 
-用法示例：
-  命令行（任一 stage 的 inference 输出都可评估）：
+Usage:
+  CLI (evaluate any stage output):
     python evaluate.py --real_dir ./data/real --gen_dir ./samples
     python evaluate.py --real_dir ./data/real --gen_dir ./samples --reference_dir ./data/anime_ref --output results.json
 
-  在代码中调用（例如 inference.py 跑完后）：
+  From code (e.g. after inference.py):
     from evaluate import run_evaluation
     run_evaluation(real_dir="./data/real", gen_dir="./samples", reference_dir="./data/anime_ref", output_path="stage1_metrics.json")
 """
@@ -27,14 +26,14 @@ from tqdm import tqdm
 # CLIP
 from transformers import CLIPModel, CLIPProcessor
 
-# Face-Sim: facenet_pytorch (需安装: pip install facenet-pytorch)
+# Face-Sim: facenet_pytorch (pip install facenet-pytorch)
 try:
     from facenet_pytorch import InceptionResnetV1, MTCNN
     HAS_FACENET = True
 except ImportError:
     HAS_FACENET = False
 
-# FID: torchmetrics (需安装: pip install torchmetrics[image])
+# FID: torchmetrics (pip install torchmetrics[image])
 try:
     from torchmetrics.image import FrechetInceptionDistance
     HAS_FID = True
@@ -42,7 +41,7 @@ except ImportError:
     HAS_FID = False
 
 
-# ---------- 配置 ----------
+# ---------- Config ----------
 CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
 STYLE_PROMPT = "a high-quality Japanese anime portrait illustration"
 FACENET_PRETRAINED = "vggface2"
@@ -50,7 +49,7 @@ IMG_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def _find_real_for_gen(gen_name: str, real_dir: str) -> Optional[str]:
-    """按文件名 stem 在 real_dir 中找对应原图。"""
+    """Find real image in real_dir by matching file stem to gen_name."""
     stem = Path(gen_name).stem
     for ext in IMG_EXTENSIONS:
         p = os.path.join(real_dir, stem + ext)
@@ -67,12 +66,10 @@ def _list_images(dir_path: str):
 
 
 def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=STYLE_PROMPT):
-    """CLIP Score: 生成图与风格描述之间的余弦相似度（与论文一致），取平均。
-    直接调用 text_model/vision_model + 投影，避免 get_*_features 在不同 transformers 版本中的不一致行为。
-    """
+    """CLIP Score: mean cosine similarity between generated images and style text (paper-consistent). Uses text_model/vision_model + projection directly to avoid get_*_features inconsistencies across transformers versions."""
     clip_model.eval()
     scores = []
-    # 文本：text_model -> pooler_output -> text_projection
+    # Text: text_model -> pooler_output -> text_projection
     text_inputs = clip_processor(text=[prompt], return_tensors="pt", padding=True).to(device)
     with torch.no_grad():
         text_out = clip_model.text_model(
@@ -82,7 +79,7 @@ def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=S
         text_pooled = text_out.pooler_output if text_out.pooler_output is not None else text_out.last_hidden_state[:, 0, :]
         text_feats = clip_model.text_projection(text_pooled)
         text_feats = F.normalize(text_feats, dim=-1)
-    # 图像：vision_model -> pooler_output -> visual_projection
+    # Image: vision_model -> pooler_output -> visual_projection
     vis_proj = getattr(clip_model, "visual_projection", None) or getattr(clip_model, "vision_projection", None)
     for path in tqdm(image_paths, desc="CLIP Score"):
         img = Image.open(path).convert("RGB")
@@ -98,7 +95,7 @@ def compute_clip_score(clip_model, clip_processor, image_paths, device, prompt=S
 
 
 def compute_face_sim(mtcnn, resnet, real_dir, gen_paths, device):
-    """Face-Sim: 每对 (real, gen) 用 FaceNet 提特征后算余弦相似度，取平均。"""
+    """Face-Sim: mean cosine similarity between (real, gen) face embeddings from FaceNet."""
     if not HAS_FACENET:
         return None
     resnet.eval()
@@ -124,7 +121,7 @@ def compute_face_sim(mtcnn, resnet, real_dir, gen_paths, device):
 
 
 def compute_fid(gen_dir, reference_dir, device, max_ref=1000, max_gen=1000):
-    """FID: 生成图分布 vs 参考艺术图分布。"""
+    """FID: generated image distribution vs reference art distribution."""
     if not HAS_FID:
         return None
     fid = FrechetInceptionDistance(normalize=True).to(device)
@@ -157,10 +154,7 @@ def run_evaluation(
     max_fid_gen: int = 500,
     device: Optional[str] = None,
 ) -> dict:
-    """
-    供其他 inference 脚本调用：传入目录路径，返回包含 clip_score / face_sim / fid 的字典。
-    若某指标未计算则对应键为 None。
-    """
+    """Called by inference (or standalone): pass dir paths, returns dict with clip_score / face_sim / fid. Uncomputed metrics are None."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     gen_names = _list_images(gen_dir)
@@ -187,7 +181,7 @@ def run_evaluation(
     else:
         results["face_sim"] = None
 
-    # FID 需要两边至少各 2 张图；单张生成图时跳过
+    # FID requires at least 2 images per side; skip in single-image mode
     if reference_dir and os.path.isdir(reference_dir) and HAS_FID and len(gen_paths) >= 2:
         results["fid"] = compute_fid(gen_dir, reference_dir, device, max_ref=max_fid_ref, max_gen=max_fid_gen)
     else:
@@ -203,11 +197,11 @@ def run_evaluation(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Face-Sim, CLIP Score, FID for any inference output.")
-    parser.add_argument("--real_dir", type=str, required=True, help="原图目录（与 gen 按文件名 stem 对应）")
-    parser.add_argument("--gen_dir", type=str, required=True, help="生成图目录（如 samples/ 或某 stage 输出）")
-    parser.add_argument("--reference_dir", type=str, default=None, help="FID 参考集（高质量艺术/动漫图）；不传则跳过 FID")
-    parser.add_argument("--output", type=str, default=None, help="结果写入 JSON 的路径")
-    parser.add_argument("--style_prompt", type=str, default=STYLE_PROMPT, help="CLIP 风格描述")
+    parser.add_argument("--real_dir", type=str, required=True, help="Real image dir (matched to gen by file stem).")
+    parser.add_argument("--gen_dir", type=str, required=True, help="Generated image dir (e.g. samples/ or stage output).")
+    parser.add_argument("--reference_dir", type=str, default=None, help="FID reference set; omit to skip FID.")
+    parser.add_argument("--output", type=str, default=None, help="Path to write results JSON.")
+    parser.add_argument("--style_prompt", type=str, default=STYLE_PROMPT, help="CLIP style description.")
     parser.add_argument("--max_fid_ref", type=int, default=500)
     parser.add_argument("--max_fid_gen", type=int, default=500)
     args = parser.parse_args()

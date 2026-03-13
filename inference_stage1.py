@@ -1,7 +1,7 @@
 """
-官方 FLUX.1-schnell Img2Img 基线：用于对比 Stage2/Stage3 自训模型效果。
-支持单张（--input / --output）与批量（--input_dir / --output_dir），
-批量后可接 --run_eval 跑 Face-Sim / CLIP Score / FID，与 inference.py 评估流程一致。
+Official FLUX.1-schnell Img2Img baseline for comparing with Stage2/Stage3 trained models.
+Supports single image (--input / --output) and batch (--input_dir / --output_dir).
+After batch run, use --run_eval for Face-Sim / CLIP Score / FID (same as inference.py).
 """
 import argparse
 import os
@@ -25,16 +25,16 @@ def _list_images(dir_path: str):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Official FLUX.1-schnell Img2Img baseline.")
-    p.add_argument("--input", type=str, default=None, help="单张：输入图像路径。")
-    p.add_argument("--output", type=str, default=None, help="单张：输出图像路径。")
-    p.add_argument("--input_dir", type=str, default=None, help="批量：原图目录（与 --output_dir 同时指定启用）。")
-    p.add_argument("--output_dir", type=str, default=None, help="批量：结果目录，将创建 real/ 与 gen/ 子目录。")
-    p.add_argument("--prompt", type=str, default="", help="引导文本。")
-    p.add_argument("--strength", type=float, default=0.6, help="对原图的修改程度 (0.0 完全不变, 1.0 全新生成)。")
-    p.add_argument("--steps", type=int, default=8, help="推理步数。")
-    p.add_argument("--run_eval", action="store_true", help="批量推理后跑 Face-Sim / CLIP Score / FID。")
-    p.add_argument("--reference_dir", type=str, default=None, help="FID 参考图目录；不传则跳过 FID。")
-    p.add_argument("--eval_output", type=str, default=None, help="评估结果 JSON 路径（如 baseline_metrics.json）。")
+    p.add_argument("--input", type=str, default=None, help="Single: input image path.")
+    p.add_argument("--output", type=str, default=None, help="Single: output image path.")
+    p.add_argument("--input_dir", type=str, default=None, help="Batch: source image dir (use with --output_dir).")
+    p.add_argument("--output_dir", type=str, default=None, help="Batch: output dir; creates real/ and gen/.")
+    p.add_argument("--prompt", type=str, default="", help="Prompt text.")
+    p.add_argument("--strength", type=float, default=0.6, help="Edit strength (0.0 unchanged, 1.0 full generation).")
+    p.add_argument("--steps", type=int, default=8, help="Inference steps.")
+    p.add_argument("--run_eval", action="store_true", help="Run Face-Sim / CLIP Score / FID after batch inference.")
+    p.add_argument("--reference_dir", type=str, default=None, help="FID reference dir; omit to skip FID.")
+    p.add_argument("--eval_output", type=str, default=None, help="Evaluation JSON path (e.g. baseline_metrics.json).")
     return p.parse_args()
 
 
@@ -91,7 +91,7 @@ def main():
             )
         return
 
-    # 单张
+    # Single image
     if not args.input or not args.output:
         print("Single-image mode: pass --input and --output. Batch mode: pass --input_dir and --output_dir.")
         return

@@ -1,7 +1,7 @@
 """
-读取 train_metrics.csv 并绘制 loss / 参数曲线。
+Read train_metrics.csv and plot loss / parameter curves.
 
-用法（在项目根目录 project 下运行）：
+Usage (from project root):
   python scripts/plot_train_metrics.py
   python scripts/plot_train_metrics.py --csv ./checkpoints/train_metrics.csv --output ./checkpoints/train_curves.png
 """
@@ -15,9 +15,9 @@ import matplotlib.pyplot as plt
 
 def main():
     p = argparse.ArgumentParser(description="Plot training metrics from train_metrics.csv")
-    p.add_argument("--csv", type=str, default="./checkpoints/train_metrics.csv", help="CSV 路径。")
-    p.add_argument("--output", type=str, default=None, help="保存图片路径；不传则只显示不保存。")
-    p.add_argument("--no-show", action="store_true", help="不弹出显示窗口，仅保存（适合无界面环境）。")
+    p.add_argument("--csv", type=str, default="./checkpoints/train_metrics.csv", help="Path to CSV.")
+    p.add_argument("--output", type=str, default=None, help="Path to save figure; omit to show only.")
+    p.add_argument("--no-show", action="store_true", help="Do not show window; save only (for headless).")
     args = p.parse_args()
 
     if not os.path.isfile(args.csv):

@@ -17,7 +17,7 @@ class CartoonDataset(Dataset):
 
         if not os.path.exists(self.real_dir) or not os.path.exists(self.cartoon_dir):
             raise FileNotFoundError(
-                f"⚠️ 路径错误！请确保 {root_dir} 下有 real 和 cartoon 文件夹"
+                f"Path error: ensure {root_dir} contains real/ and cartoon/ subdirs."
             )
 
         self.real_names = sorted([
@@ -31,10 +31,10 @@ class CartoonDataset(Dataset):
 
         if not self.real_names or not self.cartoon_names:
             raise FileNotFoundError(
-                f"⚠️ 目录为空！请确保 {self.real_dir} 与 {self.cartoon_dir} 内各有至少一张图片。"
+                f"Directories empty: ensure {self.real_dir} and {self.cartoon_dir} each have at least one image."
             )
 
-        # 更保守的数据增强：不再用 RandomResizedCrop
+        # Conservative augmentation: no RandomResizedCrop
         self.transform = transforms.Compose([
             transforms.Resize((size, size)),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -83,7 +83,7 @@ class CartoonDataset(Dataset):
             if self.use_pairs_csv:
                 real_name, cartoon_name = self.pairs[idx % len(self.pairs)]
             else:
-                # fallback：real 按 index，cartoon 随机抽，适合 unpaired style transfer
+                # Fallback: real by index, cartoon random sample (unpaired style transfer)
                 real_name = self.real_names[idx % len(self.real_names)]
                 cartoon_name = random.choice(self.cartoon_names)
 
@@ -96,7 +96,7 @@ class CartoonDataset(Dataset):
             }
 
         except Exception as e:
-            # 最多重试一次，避免坏图导致无限递归
+            # Retry at most once to avoid infinite recursion on bad images
             retry_idx = random.randint(0, n - 1)
             if retry_idx == idx:
                 retry_idx = (idx + 1) % n

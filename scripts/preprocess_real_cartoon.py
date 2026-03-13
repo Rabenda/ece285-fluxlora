@@ -1,13 +1,13 @@
 """
-FFHQ + 动漫脸数据预处理：统一尺寸、过滤、重命名，输出 real/、cartoon/、pairs.csv。
-训练时 --train_dir 指向 --out_dir 即可。
+Preprocess FFHQ + anime face data: resize, filter, rename; output real/, cartoon/, pairs.csv.
+Use --train_dir pointing to --out_dir when training.
 
-动漫侧增强（可选）：
-- --cascade：lbpcascade_animeface.xml 路径，启用后人脸检测，以脸为中心裁剪，未检测到脸则丢弃。
+Optional cartoon-side options:
+- --cascade: path to lbpcascade_animeface.xml; enable face detection, crop centered on face; drop if no face.
   wget https://raw.githubusercontent.com/nagadomi/lbpcascade_animeface/master/lbpcascade_animeface.xml
-- --min_saturation：饱和度下限，过滤线稿/灰度图（默认 20，0 表示不启用）。
-- --min_laplacian_var：Laplacian 方差下限，过滤模糊/强行放大的图（默认 0 表示不启用）。
-使用 --cascade 或 --min_laplacian_var 时需安装：pip install numpy opencv-python
+- --min_saturation: min mean saturation for cartoon (filter sketch/gray); default 20, 0=off.
+- --min_laplacian_var: min Laplacian variance (filter blur); default 0=off.
+Requires: pip install numpy opencv-python when using --cascade or --min_laplacian_var.
 """
 import argparse
 import csv
@@ -39,7 +39,7 @@ def parse_args():
     p.add_argument("--max_aspect_real", type=float, default=1.25, help="Maximum aspect ratio for real images")
     p.add_argument("--max_aspect_cartoon", type=float, default=1.35, help="Maximum aspect ratio for cartoon images")
     p.add_argument("--resume", action="store_true", help="Skip existing outputs")
-    # 动漫脸质量增强
+    # Cartoon face quality options
     p.add_argument("--cascade", type=str, default=None, help="Path to lbpcascade_animeface.xml; enable face-based crop for cartoon")
     p.add_argument("--min_saturation", type=float, default=20.0, help="Min mean saturation for cartoon (filter sketch/gray); 0=off")
     p.add_argument("--min_laplacian_var", type=float, default=0.0, help="Min Laplacian variance for cartoon (filter blur); 0=off")
@@ -78,7 +78,7 @@ def basic_filter(img: Image.Image, min_side: int, max_aspect: float) -> bool:
 
 
 def cartoon_filter_extra(img: Image.Image, min_saturation: float, min_laplacian_var: float) -> bool:
-    """过滤线稿/灰度（饱和度）、模糊图（Laplacian 方差）。阈值 0 表示不检查。"""
+    """Filter sketch/gray (saturation) and blur (Laplacian variance). Threshold 0 = skip check."""
     if min_saturation > 0:
         # PIL HSV: H 0-255, S 0-255, V 0-255
         img_hsv = np.array(img.convert("HSV"))
@@ -96,8 +96,8 @@ def cartoon_filter_extra(img: Image.Image, min_saturation: float, min_laplacian_
 
 def detect_anime_face_crop(img: Image.Image, cascade, face_pad: float):
     """
-    用 lbpcascade_animeface 检测动漫脸，取最大脸，以脸为中心按 face_pad 倍扩展裁剪为正方形。
-    返回 PIL.Image 或 None（未检测到脸或出错）。
+    Detect anime face with lbpcascade_animeface; take largest face, crop square centered on face with face_pad expansion.
+    Returns PIL.Image or None (no face or error).
     """
     import cv2
     arr = np.array(img)
@@ -122,7 +122,7 @@ def detect_anime_face_crop(img: Image.Image, cascade, face_pad: float):
     right = max(left + 1, min(right, w_img))
     bottom = max(top + 1, min(bottom, h_img))
     crop = img.crop((left, top, right, bottom))
-    # 若裁剪不是正方形，按短边中心裁成正方形
+    # If crop is not square, center-crop to square by short side
     cw, ch = crop.size
     if cw != ch:
         crop = center_crop_square(crop)
@@ -193,7 +193,7 @@ def prepare_domain(
         raise ValueError(f"No images found under {src_dir}")
 
     random.Random(seed).shuffle(files)
-    # 启用人脸检测时过滤更严，多取候选
+    # When face detection enabled, filter stricter and take more candidates
     mult = 10 if cascade_classifier is not None else 5
     candidates = files[: max(num_keep * mult, num_keep)]
 
@@ -280,12 +280,12 @@ def main():
     if not real_src.exists():
         raise FileNotFoundError(
             f"real_src not found: {real_src}\n"
-            f"当前工作目录: {Path.cwd()}\n请确认路径存在，或使用已有目录如 data_sucess/real"
+            f"Current working dir: {Path.cwd()}\nEnsure path exists or use an existing dir like data_success/real"
         )
     if not cartoon_src.exists():
         raise FileNotFoundError(
             f"cartoon_src not found: {cartoon_src}\n"
-            f"当前工作目录: {Path.cwd()}\n请确认路径存在，或使用已有目录如 data_sucess/cartoon"
+            f"Current working dir: {Path.cwd()}\nEnsure path exists or use an existing dir like data_success/cartoon"
         )
 
     ensure_dir(out_dir)

@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_FACENET = False
 
-# FaceNet 输入：160x160，值域 [0, 1]（与 facenet_pytorch / VGGFace2 常见用法一致）
+# FaceNet input: 160x160, range [0, 1] (consistent with facenet_pytorch / VGGFace2)
 FACE_SIZE = 160
 
 
@@ -48,11 +48,11 @@ class FaceIdentityLoss(nn.Module):
         return self.backbone(x.to(self._device)).float()
 
     def forward(self, x_real, x_gen):
-        # 原图作为锚点，不反传
+        # Real as anchor; no grad
         with torch.no_grad():
             real_160 = self._prep(x_real)
             emb_real = F.normalize(self._embed(real_160), dim=-1)
-        # 生成图需要梯度，经 backbone 得到 emb_gen，梯度回传到 x_gen -> LoRA
+        # Gen needs grad through backbone so grad flows to x_gen -> LoRA
         gen_160 = self._prep(x_gen)
         emb_gen = F.normalize(self._embed(gen_160), dim=-1)
         cos_sim = (emb_real * emb_gen).sum(dim=-1)

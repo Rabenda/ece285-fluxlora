@@ -1,22 +1,22 @@
 """
-Stage2 / Stage3 训练脚本。Stage1 为仅推理基线，见 inference.py（不传 --checkpoint）。
+Stage2 / Stage3 training script. Stage1 is inference-only baseline (see inference.py without --checkpoint).
 
-支持两种模型架构（--mode）：
-- full：I2I Rectified Flow（source/target、endpoint loss、t_stop 推理）
-- lite：noise-conditioned flow（x_t = (1-t)*target + t*noise，t0 推理）
+Two model modes (--mode):
+- full: I2I Rectified Flow (source/target, endpoint loss, t_stop inference)
+- lite: noise-conditioned flow (x_t = (1-t)*target + t*noise, t0 inference)
 
-数据：--train_dir 下需有 real/ 与 cartoon/ 两个子目录。
+Data: --train_dir must contain real/ and cartoon/ subdirs.
 
-# FULL 模式（推荐）
+# FULL mode (recommended)
 python train_cartoon.py --mode full --stage stage3 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
 
-# LITE 模式
+# LITE mode
 python train_cartoon.py --mode lite --stage stage3 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
 
-# Stage2：仅 LoRA
+# Stage2: LoRA only
 python train_cartoon.py --mode full --stage stage2 --train_dir ./data --checkpoint_root ./checkpoints --samples_dir ./samples
 
-# 续训 / 自检
+# Resume / sanity check
 python train_cartoon.py --stage stage3 --train_dir ./data --resume
 python train_cartoon.py --stage stage3 --train_dir ./data --sanity_check
 """
@@ -70,38 +70,38 @@ def parse_args():
     parser.add_argument("--samples_dir", type=str, default="./samples")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="每 N 個 micro-batch 累積梯度後更新一次，等效 batch_size = batch_size * N。")
-    parser.add_argument("--lr", type=float, default=5e-6, help="学习率；4bit+LoRA+accum 建议 5e-6，仍不稳可试 2e-6。")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Accumulate gradients over N micro-batches before update; effective batch = batch_size * N.")
+    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate; 5e-6 recommended for 4bit+LoRA+accum, try 2e-6 if unstable.")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--save_interval_step", type=int, default=50)
-    parser.add_argument("--preview_interval_step", type=int, default=50, help="每 N 步存 interp_preview 与 source_preview。")
-    parser.add_argument("--infer_interval_step", type=int, default=50, help="每 N 步存 compare（含 single/multi-step infer）与 infer_step_*.png。")
-    parser.add_argument("--sample_t_stop", type=float, default=0.0, help="[FULL] multi-step 从 t=1 积分到 t_stop。")
-    parser.add_argument("--sample_t0", type=float, default=0.5, help="[LITE] multi-step 起始 t0。")
-    parser.add_argument("--sample_steps", type=int, default=20, help="infer 的 ODE 步数。")
-    parser.add_argument("--sample_single_step_t", type=float, default=0.15, help="single-step probe 的步长，与 source_preview 语义一致。")
-    parser.add_argument("--source_preview_step", type=float, default=0.15, help="source-end preview 步长，独立于 interpolation preview_t。")
-    parser.add_argument("--noise_factor", type=float, default=0.02, help="起点 latent 噪声比例，与训练一致。")
+    parser.add_argument("--preview_interval_step", type=int, default=50, help="Save interp_preview and source_preview every N steps.")
+    parser.add_argument("--infer_interval_step", type=int, default=50, help="Save compare (single/multi-step infer) and infer_step_*.png every N steps.")
+    parser.add_argument("--sample_t_stop", type=float, default=0.0, help="[FULL] Multi-step integrate from t=1 to t_stop.")
+    parser.add_argument("--sample_t0", type=float, default=0.5, help="[LITE] Multi-step start t0.")
+    parser.add_argument("--sample_steps", type=int, default=20, help="ODE steps for inference sample.")
+    parser.add_argument("--sample_single_step_t", type=float, default=0.15, help="Single-step probe step size; matches source_preview semantics.")
+    parser.add_argument("--source_preview_step", type=float, default=0.15, help="Source-end preview step size (independent of interpolation preview_t).")
+    parser.add_argument("--noise_factor", type=float, default=0.02, help="Latent noise scale at start; should match training.")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--gamma_start", type=float, default=0.0, help="gamma 调度起点；新实验 A 建议 0.0。")
-    parser.add_argument("--gamma_end", type=float, default=0.3, help="gamma 调度终点；新实验 A 建议 0.3。")
-    parser.add_argument("--gamma_warmup_steps", type=int, default=300, help="gamma warmup 步数。")
-    parser.add_argument("--mix_cartoon_latent", type=float, default=0.6, help="target 中 cartoon 混合比例；0.6 让 target 更明确，利于稳定。")
+    parser.add_argument("--gamma_start", type=float, default=0.0, help="Gamma schedule start.")
+    parser.add_argument("--gamma_end", type=float, default=0.3, help="Gamma schedule end.")
+    parser.add_argument("--gamma_warmup_steps", type=int, default=300, help="Gamma warmup steps.")
+    parser.add_argument("--mix_cartoon_latent", type=float, default=0.6, help="Cartoon mix ratio in target; 0.6 keeps target clearer and more stable.")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "lite"], help="FluxI2ITrainable: full=I2I Rectified Flow, lite=noise-conditioned flow.")
-    parser.add_argument("--a1", type=float, default=0.1, help="[FULL] 条件缩放 a1（vlm_proj），LITE 忽略。")
-    parser.add_argument("--a2", type=float, default=0.05, help="[FULL] 条件缩放 a2（pooled_proj），LITE 忽略。")
+    parser.add_argument("--a1", type=float, default=0.1, help="[FULL] Condition scale a1 (vlm_proj); LITE ignores.")
+    parser.add_argument("--a2", type=float, default=0.05, help="[FULL] Condition scale a2 (pooled_proj); LITE ignores.")
     parser.add_argument("--stage", type=str, default="stage3", choices=["stage2", "stage3"], help="stage2: LoRA only; stage3: LoRA + identity loss.")
     parser.add_argument("--lambda0", type=float, default=0.6, help="Identity loss base weight in stage3.")
     parser.add_argument("--lambda_p", type=float, default=2.0, help="Time-dependent exponent in stage3.")
     parser.add_argument("--use_autocast", action="store_true")
-    parser.add_argument("--sanity_check", action="store_true", help="训练前跑一次环境/模型自检；未通过则退出。默认关闭。")
-    parser.add_argument("--train_projection", action="store_true", help="若指定则同时训练 vlm_proj/pooled_proj；默认仅训 LoRA 更稳。")
-    parser.add_argument("--no_pbar", action="store_true", help="关闭 tqdm 进度条，减少 I/O 阻塞（后台/长时间跑时建议加）。")
+    parser.add_argument("--sanity_check", action="store_true", help="Run env/model sanity check before training; exit if failed. Off by default.")
+    parser.add_argument("--train_projection", action="store_true", help="If set, also train vlm_proj/pooled_proj; default is LoRA-only for stability.")
+    parser.add_argument("--no_pbar", action="store_true", help="Disable tqdm progress bar to reduce I/O (recommended for long/background runs).")
     return parser.parse_args()
 
 
@@ -153,7 +153,7 @@ def main():
         model.pooled_proj.requires_grad_(False)
         print("Frozen vlm_proj and pooled_proj (train LoRA only). Use --train_projection to unfreeze.")
 
-    # 可选：环境自检，未通过则直接退出
+    # Optional: sanity check; exit if failed
     if args.sanity_check:
         from sanity_check import run_sanity_check
         if not run_sanity_check(device, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, verbose=True):
@@ -195,10 +195,10 @@ def main():
             print(f"Resuming from: {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location="cpu")
             if isinstance(ckpt, dict):
-                # 新格式：僅保存 LoRA 權重在 "lora" key 下
+                # New format: LoRA weights under "lora" key
                 if "lora" in ckpt:
                     model.unet.load_state_dict(ckpt["lora"], strict=False)
-                # 向後相容舊格式："model_state_dict"
+                # Backward compat: "model_state_dict"
                 elif "model_state_dict" in ckpt:
                     model.load_state_dict(ckpt["model_state_dict"], strict=False)
                 if "vlm_proj" in ckpt:
@@ -214,7 +214,7 @@ def main():
                     args.mode = ckpt_mode
                     model._mode = str(ckpt_mode).lower()
 
-    # 保存当前 LoRA 状态作为“初始”参考（resume 时则为“本次运行起点”），用于 diff 诊断
+    # Save current LoRA state as initial reference (or run start when resuming) for diff diagnostics
     init_lora_state = {}
     for name, p in model.named_parameters():
         if p.requires_grad and "lora" in name.lower():
@@ -277,7 +277,7 @@ def main():
                         model._last_spike_info = None
                     continue
 
-                # 用于 CSV 与每 50 step 打印：输出侧诊断（interpolation + source-end 两支）
+                # For CSV and every-50-step print: output-side diagnostics (interpolation + source-end)
                 last_v_pred_absmax = aux.get("v_pred_absmax")
                 last_target_v_absmax = aux.get("target_v_absmax")
                 last_v_src_absmax = aux.get("v_src_absmax")
@@ -289,7 +289,7 @@ def main():
                     sampled_t = float(aux["sampled_t"].mean().detach().item())
                     lam = lambda_schedule(sampled_t, args.lambda0, args.lambda_p)
                     with torch.amp.autocast("cuda", enabled=False):
-                        # 关键：ID Loss 必须算在 source_preview 上，强迫模型在真实推理起点保持五官
+                        # ID loss must use source_preview so the model preserves identity at the real inference start
                         id_loss = id_criterion(real_imgs.float(), aux["source_preview"].float())
                     total_loss = rf_loss + lam * id_loss
 
@@ -336,7 +336,7 @@ def main():
                             "", "", "",
                         ])
 
-                # LoRA 诊断：在 optimizer.step() 之前读取 grad，保证是“本步更新前”的梯度
+                # LoRA diagnostics: read grad before optimizer.step() so it is pre-update
                 lora_diff_mean = ""
                 lora_grad_mean = ""
                 if probe_lora_name is not None:
@@ -384,7 +384,7 @@ def main():
                         lora_grad_str,
                     ])
 
-                # 1) Training preview：interp_preview 与 source_preview 分开存，文件名明确
+                # 1) Training preview: save interp_preview and source_preview with clear filenames
                 if global_step % args.preview_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
@@ -400,7 +400,7 @@ def main():
                             save_preview_images(aux["source_preview"], os.path.join(args.samples_dir, f"source_preview_step_{global_step:06d}.png"))
                     model.train()
 
-                # 2) 真实推理 + 对比图（real | interp_preview | source_preview | infer_single | infer_multi）
+                # 2) Real inference + compare image (real | interp_preview | source_preview | infer_single | infer_multi)
                 if global_step > 0 and global_step % args.infer_interval_step == 0:
                     model.eval()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.use_autocast):
@@ -490,7 +490,7 @@ def main():
                     "",
                 ])
 
-    # 训练结束保存最终 checkpoint，避免最后一轮未对齐 save_interval 而漏存
+    # Save final checkpoint at end so we do not miss it if last epoch does not align with save_interval
     final_ckpt_path = os.path.join(args.checkpoint_root, f"full_step_{global_step:06d}_final.pt")
     lora_state = get_peft_model_state_dict(model.unet)
     torch.save(

@@ -1,23 +1,22 @@
 """
-统一推理脚本：Stage1（原版 Flux）与 Stage2/3（加载训好的 checkpoint）共用。
+Unified inference: Stage1 (vanilla FLUX) and Stage2/3 (with trained checkpoint).
 
-- 不传 --checkpoint：使用 HuggingFace 预训练权重 + 零初始化 LoRA，即 Stage1 基线。
-- 传 --checkpoint path/to/full_step_*.pt：加载该权重，即 Stage2/Stage3 推理。
+- No --checkpoint: HuggingFace pretrained + zero-initialized LoRA (Stage1 baseline).
+- With --checkpoint path/to/full_step_*.pt: load that checkpoint (Stage2/3 inference).
 
-支持单张（--input / --output）、批量（--input_dir / --output_dir）、
---organize（整理为 real/ 与 gen/）、--run_eval（Face-Sim / CLIP Score / FID）。
+Supports single image (--input / --output), batch (--input_dir / --output_dir),
+--organize (real/ and gen/ subdirs), --run_eval (Face-Sim, CLIP Score, FID).
 
-# Stage1 基线（不加载 checkpoint）
+# Stage1 baseline (no checkpoint)
 python inference.py --input ./data/real/photo4.jpg --output ./out/photo4.png
 
-# Stage2/3 推理（加载训好的权重）
+# Stage2/3 inference (with checkpoint)
 python inference.py --checkpoint ./checkpoints/full_step_000500.pt --input ./data/real/photo4.jpg --output ./out/photo4.png
 
-# 批量 + 评估（Stage2/3）
+# Batch + evaluation (Stage2/3)
 python inference.py --checkpoint ./checkpoints/full_step_000500.pt \
   --input_dir ./data/real --output_dir ./stage3_results \
   --run_eval --reference_dir ./data/anime_ref --eval_output ./stage3_metrics.json
-  
 """
 import argparse
 import os
@@ -46,34 +45,32 @@ def _list_images(dir_path: str):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Unified inference: Stage1 (no ckpt) or Stage2/3 (with --checkpoint).")
-    p.add_argument("--checkpoint", type=str, default=None, help="可选。训好的权重路径（如 full_step_000500.pt）。不传则为 Stage1 基线。")
-    p.add_argument("--input", type=str, default="./data/inference/photo4.jpg", help="单张输入路径（与 --output 搭配）。")
-    p.add_argument("--output", type=str, default="./inference_output.png", help="单张输出路径。")
-    p.add_argument("--input_dir", type=str, default=None, help="批量：原图目录。与 --output_dir 同时指定时启用批量。")
-    p.add_argument("--output_dir", type=str, default=None, help="批量：结果目录，将创建 real/ 与 gen/ 子目录并自动整理。")
-    p.add_argument("--organize", action="store_true", help="单张模式：在 output 所在目录下创建 real/ 与 gen/ 并整理，便于评估。")
-    p.add_argument("--t_stop", type=float, default=0.0, help="[FULL] 多步从 t=1 积分到 t_stop。越小越卡通。")
-    p.add_argument("--t0", type=float, default=0.5, help="[LITE] 多步起始时间 t0，dt=t0/steps。")
-    p.add_argument("--steps", type=int, default=20, help="ODE 积分步数。")
-    p.add_argument("--single_step", action="store_true", help="单步模式（FULL=source-end probe，LITE=preview 同款）。")
-    p.add_argument("--single_step_t", type=float, default=0.15, help="单步步长/step_scale。")
-    p.add_argument("--noise_factor", type=float, default=0.02, help="[FULL] 起点 latent 噪声比例。")
-    p.add_argument("--cond_scale_vlm", type=float, default=0.1, help="[FULL] 条件缩放 a1（vlm）。")
-    p.add_argument("--cond_scale_pooled", type=float, default=0.05, help="[FULL] 条件缩放 a2（pooled）。")
-    p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it. Schnell 推理时自动忽略。")
+    p.add_argument("--checkpoint", type=str, default=None, help="Optional. Path to trained weights (e.g. full_step_000500.pt). Omit for Stage1.")
+    p.add_argument("--input", type=str, default="./data/inference/photo4.jpg", help="Single input path (use with --output).")
+    p.add_argument("--output", type=str, default="./inference_output.png", help="Single output path.")
+    p.add_argument("--input_dir", type=str, default=None, help="Batch: source image dir. Use with --output_dir for batch mode.")
+    p.add_argument("--output_dir", type=str, default=None, help="Batch: output dir; creates real/ and gen/ subdirs.")
+    p.add_argument("--organize", action="store_true", help="Single-image: create real/ and gen/ under output dir for evaluation.")
+    p.add_argument("--t_stop", type=float, default=0.0, help="[FULL] Multi-step integrate from t=1 to t_stop; lower = more cartoon.")
+    p.add_argument("--t0", type=float, default=0.5, help="[LITE] Multi-step start t0; dt=t0/steps.")
+    p.add_argument("--steps", type=int, default=20, help="ODE integration steps.")
+    p.add_argument("--single_step", action="store_true", help="Single-step mode (FULL=source-end probe, LITE=preview-style).")
+    p.add_argument("--single_step_t", type=float, default=0.15, help="Single-step size / step_scale.")
+    p.add_argument("--noise_factor", type=float, default=0.02, help="[FULL] Latent noise scale at start.")
+    p.add_argument("--cond_scale_vlm", type=float, default=0.1, help="[FULL] Condition scale a1 (vlm).")
+    p.add_argument("--cond_scale_pooled", type=float, default=0.05, help="[FULL] Condition scale a2 (pooled).")
+    p.add_argument("--guidance", type=float, default=1.0, help="Guidance scale when UNet supports it. Ignored for Schnell.")
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--run_eval", action="store_true", help="推理并整理后跑 Face-Sim / CLIP Score / FID。")
-    p.add_argument("--real_dir", type=str, default=None, help="单张且未 --organize 时评估用原图目录；批量/organize 时无需传。")
-    p.add_argument("--reference_dir", type=str, default=None, help="FID 参考图目录；不传则跳过 FID。")
-    p.add_argument("--eval_output", type=str, default=None, help="评估结果 JSON 路径（如 stage1_metrics.json）。")
+    p.add_argument("--run_eval", action="store_true", help="Run Face-Sim / CLIP Score / FID after inference.")
+    p.add_argument("--real_dir", type=str, default=None, help="Real image dir for eval when single-image and not --organize.")
+    p.add_argument("--reference_dir", type=str, default=None, help="FID reference image dir; omit to skip FID.")
+    p.add_argument("--eval_output", type=str, default=None, help="Path for evaluation JSON (e.g. stage1_metrics.json).")
     return p.parse_args()
 
 
 def _run_one(model, device, img_tensor, args):
-    """对单张 img_tensor (1,C,H,W) 做一次推理，返回 (C,H,W) 在 [0,1]。
-    根据 model._mode 选 FULL（I2I RF, t_stop/a1/a2）或 LITE（noise-conditioned, t0）。
-    """
+    """Run one inference on img_tensor (1,C,H,W); return (C,H,W) in [0,1]. Uses model._mode: FULL (I2I RF, t_stop/a1/a2) or LITE (noise-conditioned, t0)."""
     steps = max(1, int(args.steps))
     is_lite = getattr(model, "_mode", "full") == "lite"
     with torch.no_grad():
@@ -102,7 +99,7 @@ def _run_one(model, device, img_tensor, args):
         guidance_t = torch.full((1,), 0.0, device=device, dtype=torch.bfloat16)
 
     if is_lite:
-        # LITE: x_t = (1-t)*x_start + t*noise, 多步 dt=t0/steps
+        # LITE: x_t = (1-t)*x_start + t*noise, multi-step dt=t0/steps
         with torch.no_grad():
             x_start = model._pack(latents).to(torch.bfloat16)
             noise = torch.randn_like(x_start)
@@ -145,7 +142,7 @@ def _run_one(model, device, img_tensor, args):
                     v_pred = torch.nan_to_num(v_pred, nan=0.0)
                     x_t = x_t - v_pred * dt
     else:
-        # FULL: I2I RF，起点 packed_source，从 t=1 积到 t_stop
+        # FULL: I2I RF, start at packed_source, integrate from t=1 to t_stop
         with torch.no_grad():
             packed_real = model._pack(latents).to(torch.bfloat16)
             noise = torch.randn_like(packed_real)
@@ -234,7 +231,7 @@ def main():
         print(f"Loading model from checkpoint: {args.checkpoint}")
     else:
         print("Loading pretrained model only (NO checkpoint).")
-    # 若 checkpoint 未保存 mode（旧版 LITE 训练），从路径推断，否则 LITE 权重会被当成 FULL 推理导致异常
+    # If checkpoint has no mode (old LITE training), infer from path; else LITE weights would be run as FULL
     if isinstance(ckpt, dict) and "mode" in ckpt:
         mode = ckpt["mode"]
     elif args.checkpoint and "lite" in args.checkpoint.lower():
@@ -245,11 +242,11 @@ def main():
     model.setup_lora(rank=args.lora_rank, alpha=args.lora_alpha)
     if ckpt is not None:
         if isinstance(ckpt, dict):
-            # 優先載入 LoRA 權重（新格式）
+            # Prefer LoRA weights (new format)
             if "lora" in ckpt:
                 res = model.unet.load_state_dict(ckpt["lora"], strict=False)
                 print("[LoRA load] missing:", len(res.missing_keys), "unexpected:", len(res.unexpected_keys))
-            # 向後相容舊格式：整個 model_state_dict
+            # Backward compat: full model_state_dict
             elif "model_state_dict" in ckpt:
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
             if "vlm_proj" in ckpt:
@@ -257,7 +254,7 @@ def main():
             if "pooled_proj" in ckpt:
                 model.pooled_proj.load_state_dict(ckpt["pooled_proj"])
         else:
-            # 最後退路：當成完整 state_dict 載入
+            # Fallback: load as full state_dict
             model.load_state_dict(ckpt, strict=False)
     model.vae.to(torch.float32)
     model.eval()
@@ -286,7 +283,7 @@ def main():
             )
         return
 
-    # 单张模式
+    # Single-image mode
     img_tensor = transform(Image.open(args.input).convert("RGB")).unsqueeze(0).to(device)
     print("Refining trajectory...")
     out_img = _run_one(model, device, img_tensor, args)

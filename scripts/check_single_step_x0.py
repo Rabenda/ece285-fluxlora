@@ -1,12 +1,12 @@
 """
-第二步排查：单步 x0 恢复（preview 公式）是否比多步 Euler 稳定。
+Second diagnostic: single-step x0 recovery (preview formula) vs multi-step Euler.
 
-用法（在项目根目录 project 下运行）：
+Usage (from project root):
   python scripts/check_single_step_x0.py --input ./data/real/xxx.jpg --output single_step_x0.png
 
-作用：只做一次 x0 = x_t - t * v_pred（t=0.2），不跑多步 ODE，然后 decode 保存。
-- 若单步结果明显好于 35 步 Euler：多步 sampler 是主要问题，需对照 FLUX 官方/课程改 inference。
-- 若单步也很花/栅格：问题更早，在 conditioning / img_ids / 或 base 用法。
+Runs once x0 = x_t - t * v_pred (t=0.2), no multi-step ODE, then decode and save.
+- If single-step is much better than 35-step Euler: multi-step sampler is the main issue; fix inference ODE/schedule.
+- If single-step is also noisy/grid: issue is earlier (conditioning / img_ids / or base usage).
 """
 import argparse
 import os
@@ -25,9 +25,9 @@ from models.flux_i2i_trainable import FluxI2ITrainable
 
 def main():
     p = argparse.ArgumentParser(description="Check single-step x0 recovery (preview formula).")
-    p.add_argument("--input", type=str, default="./data/real/photo4.jpg", help="输入图片路径。")
-    p.add_argument("--output", type=str, default="./single_step_x0.png", help="输出保存路径。")
-    p.add_argument("--t", type=float, default=0.2, help="单步使用的 t（与训练 preview_t 一致）。")
+    p.add_argument("--input", type=str, default="./data/real/photo4.jpg", help="Input image path.")
+    p.add_argument("--output", type=str, default="./single_step_x0.png", help="Output path.")
+    p.add_argument("--t", type=float, default=0.2, help="Single-step t (match training preview_t).")
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
     args = p.parse_args()
@@ -87,7 +87,7 @@ def main():
         v_pred = model.unet(**unet_kw)[0]
         v_pred = torch.nan_to_num(v_pred, nan=0.0).clamp(-3.0, 3.0)
 
-        # 单步 x0（preview 公式），无多步循环
+        # Single-step x0 (preview formula), no multi-step loop
         x0 = x_t - t_tensor.view(-1, 1, 1) * v_pred
         out_latents = model._unpack(x0, h, w).to(torch.float32)
         out_latents = out_latents.clamp(-5.0, 5.0)
@@ -99,8 +99,8 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     vutils.save_image(out_arr, out_path)
     print(f"Saved: {out_path}")
-    print("  -> 若比 35 步 Euler 好很多：多步 sampler 是主因，需改 inference 的 ODE/时间调度。")
-    print("  -> 若也很花/栅格：问题在 conditioning / img_ids 或 FLUX 用法。")
+    print("  -> If much better than 35-step Euler: multi-step sampler is the cause; fix inference ODE/schedule.")
+    print("  -> If also noisy/grid: issue is in conditioning / img_ids or FLUX usage.")
 
 
 if __name__ == "__main__":

@@ -10,15 +10,12 @@ from peft import LoraConfig, get_peft_model
 
 
 def _flux_unet_accepts_guidance(unet: FluxTransformer2DModel) -> bool:
-    """
-    檢查給定的 FluxTransformer2DModel 是否在 forward 簽名中接受 guidance 參數。
-    這比依賴 diffusers 版本號更可靠，可同時相容舊版與 0.30+/0.36+。
-    """
+    """Check whether the given FluxTransformer2DModel accepts a guidance parameter in its forward signature. More reliable than relying on diffusers version; works with both old and 0.30+/0.36+."""
     try:
         sig = inspect.signature(unet.forward)
         return "guidance" in sig.parameters
     except Exception:
-        # 若無法檢查簽名，保守地視為接受 guidance，以相容舊版行為。
+        # If we cannot inspect signature, assume guidance is accepted for backward compat.
         return True
 
 
@@ -58,7 +55,7 @@ class FluxI2ITrainable(nn.Module):
             torch_dtype=torch.bfloat16,
         )
         self.unet.enable_gradient_checkpointing()
-        # 檢查當前 unet 是否支援 guidance 參數（舊版支援，diffusers 0.30+ 的 schnell 通常不支援）
+        # Check if current unet supports guidance (old diffusers yes; 0.30+ schnell often no)
         self._accepts_guidance = _flux_unet_accepts_guidance(self.unet)
 
         # ---------- 3) CLIP vision ----------
@@ -67,7 +64,7 @@ class FluxI2ITrainable(nn.Module):
         ).to("cuda", dtype=torch.bfloat16)
         self.clip_vision.requires_grad_(False)
 
-        # Projection layers（小初始化 + 前向里 LayerNorm + 0.01， conditioning 更稳）
+        # Projection layers (small init + LayerNorm + 0.01 in forward for stable conditioning)
         self.vlm_proj = nn.Linear(1024, 4096).to("cuda", dtype=torch.bfloat16)
         nn.init.normal_(self.vlm_proj.weight, std=1e-5)
         nn.init.constant_(self.vlm_proj.bias, 0.0)
@@ -158,7 +155,7 @@ class FluxI2ITrainable(nn.Module):
         w_range = torch.arange(w2, device=device)
         grid_y, grid_x = torch.meshgrid(h_range, w_range, indexing="ij")
         
-        # 修复位置编码：索引1才是高度，索引2才是宽度！
+        # Position encoding fix: index 1 is height, index 2 is width
         img_ids = torch.zeros((h2, w2, 3), device=device)
         img_ids[..., 1] = grid_y 
         img_ids[..., 2] = grid_x 
@@ -221,7 +218,7 @@ class FluxI2ITrainable(nn.Module):
             vlm_feats = clip_outputs.last_hidden_state   # [B,257,1024]
             vlm_pooled = clip_outputs.pooler_output      # [B,1024]
 
-        # Condition injection（LITE: 固定 0.01/0.01；FULL: 可传参 a1/a2）
+        # Condition injection (LITE: fixed 0.01/0.01; FULL: a1/a2 args)
         vlm_proj_out = self.vlm_proj(vlm_feats)
         vlm_proj_out = F.layer_norm(vlm_proj_out, (vlm_proj_out.shape[-1],))
         pooled_projections = self.pooled_proj(vlm_pooled)
@@ -258,7 +255,7 @@ class FluxI2ITrainable(nn.Module):
             bias_up = F.interpolate(bias_low, size=z_real.shape[-2:], mode="bilinear", align_corners=False)
             bias_up = self._blur_latent(bias_up)
 
-            # gamma 调度只由训练脚本外层控制，此处不再做内层 warmup
+            # Gamma schedule is controlled by training script; no inner warmup here
             gamma_eff = gamma
 
             # domain pull + flatten
@@ -378,7 +375,7 @@ class FluxI2ITrainable(nn.Module):
                 "packed_latents": packed_latents.detach(),
                 "v_pred_absmax": v_pred_f.abs().max().detach().item(),
                 "target_v_absmax": target_v.abs().max().detach().item(),
-                "source_preview": out_image.detach(),  # LITE 无独立 source-end，用预览图兼容 Stage3 id_loss
+                "source_preview": out_image.detach(),  # LITE has no separate source-end; use preview for Stage3 id_loss
             }
             return loss, out_image, aux
 
@@ -498,7 +495,7 @@ class FluxI2ITrainable(nn.Module):
             self._last_spike_info = None
 
         # --------- 4) Preview ----------
-        # interpolation preview：从 t=preview_t 的插值点出发
+        # Interpolation preview: start from interpolated point at t=preview_t
         need_preview_grad = self.training and return_aux
         preview_ctx = nullcontext() if need_preview_grad else torch.no_grad()
         with preview_ctx:
@@ -530,7 +527,7 @@ class FluxI2ITrainable(nn.Module):
         if not return_aux:
             return loss, out_image
 
-        # source-end preview：真正贴近推理的 probe，t=1 状态（仅 return_aux 时计算）
+        # Source-end preview: probe close to real inference, t=1 state (only when return_aux)
         with torch.no_grad():
             t_src = torch.ones((bsz,), device=device, dtype=dtype)
             noise_src = torch.randn_like(packed_real)
