@@ -15,19 +15,33 @@ Image-only, identity-aware cartoonization using FLUX.1-schnell with LoRA. No tex
 
 ```
 project/
-├── train_cartoon.py       # Training entry (Stage2/Stage3)
-├── inference.py           # Unified inference (Stage1 without ckpt, Stage2/3 with ckpt)
-├── evaluate.py            # Metrics: Face-Sim, CLIP Score, FID
-├── dataset.py             # CartoonDataset (real/ + cartoon/ under --train_dir)
-├── identity_loss.py       # Stage3 face identity loss (FaceNet)
+├── train_cartoon.py           # Training entry (Stage2/Stage3)
+├── inference.py               # Unified inference (Stage1 without ckpt, Stage2/3 with ckpt)
+├── evaluate.py                # Metrics: Face-Sim, CLIP Score, FID
+├── dataset.py                 # CartoonDataset (real/ + cartoon/ under --train_dir)
+├── identity_loss.py           # Stage3 face identity loss (FaceNet)
 ├── models/
-│   └── flux_i2i_trainable.py   # FLUX + LoRA, full/lite flow modes
+│   └── flux_i2i_trainable.py  # FLUX + LoRA, full/lite flow modes
 ├── scripts/
 │   ├── download_stable_faces.py
 │   ├── preprocess_real_cartoon.py
+│   ├── plot_train_metrics.py
 │   └── ...
+├── selected_profiling_data/   # Selected training profiling data (see below)
+│   ├── train_metrics_stage2_v8_cartoon=0.45.csv
+│   ├── train_metrics_stage2_v9_cartoon=0.8.csv
+│   ├── train_metrics_stage2_v10.csv
+│   ├── train_metrics_stage3_0.05 and 0.02_v13.csv
+│   ├── train_metrics_stage3_0.05 and 0.02_v14.csv
+│   └── train_metrics_stage3_0.1 and 0.05_v15.csv
 └── README.md
 ```
+
+## Profiling / experimental data
+
+The `selected_profiling_data/` folder contains **a curated subset of our training profiling data**, used to reproduce and verify the training curves and metrics of this work (e.g. flow loss, identity loss, learning rate, gradient norm over steps). It includes training-metrics CSVs for Stage2 and Stage3 under various configurations (e.g. cartoon conditioning strength, identity loss weight).
+
+**If you are interested in the full profiling or complete experimental datasets for research, please contact our team.**
 
 ## Data
 
